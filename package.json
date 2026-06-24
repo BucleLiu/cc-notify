@@ -1,0 +1,34 @@
+{
+  "name": "@bucle/cc-notify",
+  "version": "1.0.4",
+  "description": "Mac floating sticky-note notifications for Claude Code and Codex events",
+  "bin": {
+    "ccn": "bin/ccn.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/notify.sh",
+    "scripts/sticky-window.swift",
+    "scripts/postinstall.js"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "notification",
+    "macos",
+    "sticky-note",
+    "hooks"
+  ],
+  "license": "MIT"
+}

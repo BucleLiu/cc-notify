@@ -1,0 +1,49 @@
+# ===========================
+# IDE / Editor
+# ===========================
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+*.swp
+*.swo
+*~
+
+# ===========================
+# macOS
+# ===========================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ===========================
+# Compiled Binaries & Apps
+# ===========================
+*.app/
+*.o
+*.out
+scripts/sticky-notify-app
+scripts/sticky-notify.app/
+
+# ===========================
+# cc-notify (npm package)
+# ===========================
+node_modules/
+package-lock.json
+
+# ===========================
+# Test Scripts (local only)
+# ===========================
+**/test.sh
+
+# ===========================
+# Logs & Temp Files
+# ===========================
+*.log
+*.tmp
+*.temp

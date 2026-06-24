@@ -1,0 +1,16 @@
+# npm publish exclusions for cc-notify
+
+# macOS metadata
+.DS_Store
+._*
+
+# Compiled binaries (built locally by postinstall.js)
+scripts/sticky-notify-app
+scripts/sticky-notify.app/
+
+# Dev artifacts
+.claude/
+scripts/test.sh
+
+# Git
+.gitignore
