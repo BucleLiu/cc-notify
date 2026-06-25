@@ -35,6 +35,8 @@ const CURRENT_VER = PKG_JSON.version;
 // Source files (inside the npm package)
 const SRC_NOTIFY_SH = path.join(PKG_DIR, 'scripts', 'notify.sh');
 const SRC_SWIFT     = path.join(PKG_DIR, 'scripts', 'sticky-window.swift');
+const SRC_APPROVAL_HOOK   = path.join(PKG_DIR, 'scripts', 'approval-hook.js');
+const SRC_APPROVAL_SERVER = path.join(PKG_DIR, 'scripts', 'approval-server.js');
 
 // Install directory
 const INSTALL_DIR  = path.join(os.homedir(), '.cc-notify');
@@ -92,6 +94,19 @@ function main() {
   fs.copyFileSync(SRC_NOTIFY_SH, NOTIFY_SH);
   fs.chmodSync(NOTIFY_SH, 0o755);
   log('Copied notify.sh');
+
+  // 4b. Copy approval scripts (always — picks up updates on npm update)
+  for (const [src, name] of [
+    [SRC_APPROVAL_HOOK, 'approval-hook.js'],
+    [SRC_APPROVAL_SERVER, 'approval-server.js'],
+  ]) {
+    if (fs.existsSync(src)) {
+      const dest = path.join(INSTALL_DIR, name);
+      fs.copyFileSync(src, dest);
+      fs.chmodSync(dest, 0o755);
+      log(`Copied ${name}`);
+    }
+  }
 
   // 5. Compile Swift (skip if version matches and binary exists)
   const forceRecompile = process.env.CC_NOTIFY_FORCE_RECOMPILE === '1';
