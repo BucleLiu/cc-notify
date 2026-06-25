@@ -13,7 +13,9 @@
     "lib/",
     "scripts/notify.sh",
     "scripts/sticky-window.swift",
-    "scripts/postinstall.js"
+    "scripts/postinstall.js",
+    "scripts/approval-hook.js",
+    "scripts/approval-server.js"
   ],
   "os": [
     "darwin"
