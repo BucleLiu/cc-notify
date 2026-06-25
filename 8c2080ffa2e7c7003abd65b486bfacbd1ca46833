@@ -1,0 +1,23 @@
+scripts/sticky-window.swift
+  2d362cf1b89bf469 274-280,334,650-693,890-902,1260-1358
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.16-yd",
+  "base_commit_sha": "8c2080ffa2e7c7003abd65b486bfacbd1ca46833",
+  "prompts": {
+    "2d362cf1b89bf469": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e6559d2-ca9b-483e-a893-33f218e715a8",
+        "model": "gpt-5.5"
+      },
+      "human_author": "liuwenlong01 <liuwenlong01@corp.netease.com>",
+      "messages": [],
+      "total_additions": 164,
+      "total_deletions": 0,
+      "accepted_lines": 164,
+      "overriden_lines": 0
+    }
+  }
+}
