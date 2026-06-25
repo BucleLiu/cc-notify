@@ -271,6 +271,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var closeTimer: Timer?
     var closeTimeout: Double = 3600
 
+    // ── Approval mode
+    var isApproval = false
+    var approvalData: [String: Any]?
+    var approvalFilePath: String = ""
+    var approvalButtons: [NSButton] = []
+    var approvalButtonsDisabled = false
+
     // ── Theme colors — switch on isUrgent ─────────────────────────────────
     var cardBgColor: NSColor {
         isUrgent
@@ -324,6 +331,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.posFilePath   = base + ".pos"
         self.widFilePath   = base + ".wid"
         self.slotFilePath  = base + ".slot"
+        self.approvalFilePath = base + ".approval.json"
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -639,6 +647,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func postDecision(_ decision: String, message: String? = nil) {
+        guard let endpoint = approvalData?["decisionEndpoint"] as? String,
+              let requestId = approvalData?["requestId"] as? String,
+              !approvalButtonsDisabled else { return }
+        approvalButtonsDisabled = true
+        for btn in approvalButtons { btn.isEnabled = false }
+        guard let url = URL(string: endpoint) else { return }
+        var body: [String: String] = ["requestId": requestId, "decision": decision]
+        if let msg = message { body["message"] = msg }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 10
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let task = URLSession.shared.dataTask(with: req) { [weak self] data, resp, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let httpResp = resp as? HTTPURLResponse {
+                    if httpResp.statusCode == 200 {
+                        self.exitApprovalMode(statusText: decision == "deny" ? "🚫 Denied" : "✅ Approved")
+                    } else if httpResp.statusCode == 409 {
+                        self.exitApprovalMode(statusText: "Already decided")
+                    } else if httpResp.statusCode == 404 {
+                        self.exitApprovalMode(statusText: "Request not found")
+                    } else {
+                        self.cardView?.showTooltip("Error: \(httpResp.statusCode)", locationInWindow: NSPoint(x: 50, y: 30))
+                    }
+                } else if error != nil {
+                    if self.approvalButtonsDisabled {
+                        self.approvalButtonsDisabled = false
+                        for btn in self.approvalButtons { btn.isEnabled = true }
+                    }
+                    self.cardView?.showTooltip("Network error — try again", locationInWindow: NSPoint(x: 50, y: 30))
+                }
+            }
+        }
+        task.resume()
+    }
+
+    @objc func approvalAllowAction()  { postDecision("allow") }
+    @objc func approvalDenyAction()   { postDecision("deny", message: "Denied from sticky note") }
+    @objc func approvalAlwaysAction()  { postDecision("allow_always") }
+    @objc func approvalFocusAction()  { focusTerminal() }
+
     func focusTerminal() {
         debugLog("--- focusTerminal called ---")
         guard let raw = try? String(contentsOfFile: focusFilePath, encoding: .utf8) else {
@@ -835,6 +887,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func reloadContent() {
         guard let text = try? String(contentsOfFile: contentFilePath, encoding: .utf8) else { return }
         updateLabels(from: text)
+        // Check for approval mode
+        if text.hasPrefix("__APPROVAL__") && !isApproval {
+            if let approvalRaw = try? String(contentsOfFile: approvalFilePath, encoding: .utf8),
+               let approvalObj = try? JSONSerialization.jsonObject(with: Data(approvalRaw.utf8)) as? [String: Any] {
+                approvalData = approvalObj
+                enterApprovalMode()
+                return
+            }
+        }
+        if !text.hasPrefix("__APPROVAL__") && isApproval {
+            exitApprovalMode(statusText: text)
+            return
+        }
         applyTheme()
         if isCollapsed, let icon = iconLabel {
             // Update circle icon but do NOT auto-expand
@@ -1190,6 +1255,105 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isCollapsed {
             cardView.layer?.borderColor = accentBar.currentColor.cgColor
         }
+    }
+
+    func enterApprovalMode() {
+        guard let data = approvalData else { return }
+        isApproval = true
+        closeTimer?.invalidate()
+        closeTimer = nil
+        cardView.layer?.backgroundColor = NSColor(calibratedRed: 0.94, green: 0.96, blue: 1.0, alpha: 1.0).cgColor
+
+        let toolName = data["toolName"] as? String ?? ""
+        let summary  = data["summary"] as? String ?? ""
+        let provider = data["provider"] as? String ?? "claude"
+        let providerName = provider == "codex" ? "Codex" : "Claude Code"
+        headerLabel.stringValue = "🔐 \(providerName) Approval"
+
+        for lbl in metaLineLabels { lbl.removeFromSuperview() }
+        metaLineLabels.removeAll()
+
+        let metaAreaY: CGFloat = 8
+        let metaAreaH: CGFloat = noteH - 28 - 16
+        let lineH: CGFloat = 15
+
+        let toolLabel = PassthroughLabel(labelWithString: "Tool: \(toolName)")
+        toolLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 36, width: noteW - 140, height: lineH)
+        toolLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        toolLabel.textColor = NSColor(calibratedRed: 0.15, green: 0.20, blue: 0.30, alpha: 1.0)
+        toolLabel.lineBreakMode = .byTruncatingTail
+        cardView.addSubview(toolLabel)
+        metaLineLabels.append(toolLabel)
+
+        let summaryLabel = PassthroughLabel(labelWithString: summary)
+        summaryLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 54, width: noteW - 140, height: lineH)
+        summaryLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        summaryLabel.textColor = NSColor(calibratedRed: 0.25, green: 0.30, blue: 0.40, alpha: 1.0)
+        summaryLabel.lineBreakMode = .byTruncatingTail
+        cardView.addSubview(summaryLabel)
+        metaLineLabels.append(summaryLabel)
+
+        let projectName = storedMetaLines
+            .first(where: { $0.hasPrefix("Project:") })
+            .flatMap { line -> String? in
+                guard let idx = line.firstIndex(of: ":") else { return nil }
+                return line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
+            } ?? ""
+        if !projectName.isEmpty {
+            let projLabel = PassthroughLabel(labelWithString: "Project: \(projectName)")
+            projLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 72, width: noteW - 140, height: lineH)
+            projLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            projLabel.textColor = NSColor(calibratedRed: 0.40, green: 0.45, blue: 0.55, alpha: 1.0)
+            projLabel.lineBreakMode = .byTruncatingTail
+            cardView.addSubview(projLabel)
+            metaLineLabels.append(projLabel)
+        }
+
+        let btnX = noteW - 130
+        let btnW: CGFloat = 116
+        let btnH: CGFloat = 22
+        let btnGap: CGFloat = 4
+        let buttonBaseY = metaAreaY + 4
+
+        let buttonDefs: [(title: String, action: Selector, color: NSColor)] = [
+            ("Allow",  #selector(approvalAllowAction),  NSColor(calibratedRed: 0.18, green: 0.62, blue: 0.18, alpha: 1.0)),
+            ("Deny",   #selector(approvalDenyAction),   NSColor(calibratedRed: 0.82, green: 0.18, blue: 0.18, alpha: 1.0)),
+            ("Always", #selector(approvalAlwaysAction),  NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.10, alpha: 1.0)),
+            ("Focus",  #selector(approvalFocusAction),   NSColor(calibratedRed: 0.35, green: 0.45, blue: 0.60, alpha: 1.0)),
+        ]
+
+        for (i, def) in buttonDefs.enumerated() {
+            let btn = NSButton(frame: NSRect(x: btnX, y: buttonBaseY + CGFloat(i) * (btnH + btnGap), width: btnW, height: btnH))
+            btn.title = def.title
+            btn.isBordered = true
+            btn.bezelStyle = .rounded
+            btn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            btn.target = self
+            btn.action = def.action
+            btn.wantsLayer = true
+            btn.layer?.backgroundColor = def.color.cgColor
+            btn.layer?.cornerRadius = 4
+            btn.contentTintColor = NSColor.white
+            cardView.addSubview(btn)
+            approvalButtons.append(btn)
+        }
+
+        cardView.closeBtnFrame = closeBtn.frame
+        cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 154, height: noteH - 16)
+    }
+
+    func exitApprovalMode(statusText: String) {
+        isApproval = false
+        approvalData = nil
+        for btn in approvalButtons { btn.removeFromSuperview() }
+        approvalButtons.removeAll()
+        for lbl in metaLineLabels { lbl.removeFromSuperview() }
+        metaLineLabels.removeAll()
+        updateLabels(from: statusText)
+        applyTheme()
+        cardView.closeBtnFrame = closeBtn.frame
+        cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
+        scheduleCloseTimer()
     }
 
     /// Dismiss urgent mode: reset to normal theme (visual only).
