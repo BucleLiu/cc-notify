@@ -1,0 +1,23 @@
+scripts/postinstall.js
+  2d362cf1b89bf469 38-39,98-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.16-yd",
+  "base_commit_sha": "b27c31c1766b20feb07c66bfce45bbfb4d3eb14b",
+  "prompts": {
+    "2d362cf1b89bf469": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e6559d2-ca9b-483e-a893-33f218e715a8",
+        "model": "gpt-5.5"
+      },
+      "human_author": "liuwenlong01 <liuwenlong01@corp.netease.com>",
+      "messages": [],
+      "total_additions": 15,
+      "total_deletions": 0,
+      "accepted_lines": 15,
+      "overriden_lines": 0
+    }
+  }
+}
