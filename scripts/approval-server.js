@@ -10,7 +10,17 @@ const crypto = require('crypto');
 
 const INSTALL_DIR    = path.join(os.homedir(), '.cc-notify');
 const RUNTIME_JSON   = path.join(INSTALL_DIR, 'runtime.json');
-const PKG_JSON       = require(path.join(__dirname, '..', 'package.json'));
+
+let SERVER_VERSION = 'unknown';
+try {
+  // When running from repo (dev): ../package.json
+  SERVER_VERSION = require(path.join(__dirname, '..', 'package.json')).version;
+} catch {
+  try {
+    // When running from ~/.cc-notify/ (installed): read .version
+    SERVER_VERSION = fs.readFileSync(path.join(INSTALL_DIR, '.version'), 'utf8').trim();
+  } catch {}
+}
 
 const TMP_DIR        = '/tmp/cc-notify';
 
@@ -20,7 +30,6 @@ const PORT_START          = parseInt(process.env.CC_NOTIFY_APPROVAL_PORT_RANGE_S
 const PORT_END            = parseInt(process.env.CC_NOTIFY_APPROVAL_PORT_RANGE_END || '23337', 10);
 const MAX_PENDING         = 10;
 const SERVER_NAME         = 'cc-notify-approval';
-const SERVER_VERSION      = PKG_JSON.version;
 
 function findAvailablePort(start, end) {
   const net = require('net');
