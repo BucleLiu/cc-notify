@@ -1,0 +1,25 @@
+lib/commands/status.js
+  2d362cf1b89bf469 28-30,48,102-125,189,194
+lib/utils.js
+  2d362cf1b89bf469 18-25,327,329-331
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.16-yd",
+  "base_commit_sha": "e3a897135710e7e9227c82e1fa13092106618ac5",
+  "prompts": {
+    "2d362cf1b89bf469": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e6559d2-ca9b-483e-a893-33f218e715a8",
+        "model": "gpt-5.5"
+      },
+      "human_author": "liuwenlong01 <liuwenlong01@corp.netease.com>",
+      "messages": [],
+      "total_additions": 42,
+      "total_deletions": 4,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
