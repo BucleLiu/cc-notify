@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isCollapsed = false
     var isUrgent = false   // true when content starts with __URGENT__
     var storedMetaLines: [String] = []
-    var noteW: CGFloat = 240
+    var noteW: CGFloat = 190
     let noteH: CGFloat = 80
     var dividerView: NSView!
     var resizeHandle: ResizeHandleView!
@@ -502,7 +502,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             frame: NSRect(x: noteW - 4, y: 0, width: 4, height: rowY - 4))
         resizeHandle.onDrag = { [weak self] delta in
             guard let self = self else { return }
-            let minW: CGFloat = 225
+            let minW: CGFloat = 180
             let maxW: CGFloat = 600
             let newW = max(minW, min(maxW, self.noteW - delta))
             guard abs(newW - self.noteW) > 0.5 else { return }
@@ -529,12 +529,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             selector: #selector(checkInodeChanged),
             userInfo: nil, repeats: true)
 
-        // Tap behaviour: dismiss urgent first, then expand when collapsed / focus terminal when expanded
+        // Tap behaviour: expand when collapsed, or focus terminal when expanded.
+        // Urgent theme persists until the next event overwrites the content.
         cardView.closeBtnFrame = closeBtn.frame
         cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
         cardView.onTap = { [weak self] in
             guard let self = self else { return }
-            self.dismissUrgent()
             if self.isCollapsed { self.expandWindow() } else { self.focusTerminal() }
         }
 
@@ -611,6 +611,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         iconLabel = nil
         for sub in cardView.subviews {
             sub.isHidden = false
+        }
+
+        // In approval mode, the content label must stay hidden — the buttons
+        // replace it.  Also re-hide any stale meta line labels.
+        if isApproval {
+            contentLabel.isHidden = true
+            for lbl in metaLineLabels { lbl.isHidden = true }
         }
 
         // Restore cardView layer to rounded-rect card
@@ -1265,6 +1272,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preApprovalIsUrgent = isUrgent
         preApprovalContentText = contentLabel.stringValue
 
+        // Update header to show the approval icon while keeping the project name
+        let projectName = storedMetaLines
+            .first(where: { $0.hasPrefix("Project:") })
+            .flatMap { line -> String? in
+                guard let idx = line.firstIndex(of: ":") else { return nil }
+                return line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
+            }
+        headerLabel.stringValue = "🔐 " + (projectName ?? "")
+
         // If collapsed, expand so the user can see and interact with the buttons
         if isCollapsed { expandWindow() }
 
@@ -1299,13 +1315,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         metaLineLabels.removeAll()
 
         // ── Horizontal button row: Allow / Deny / Always ─────────────────
-        let btnW: CGFloat = 60
-        let btnH: CGFloat = 26
-        let btnGap: CGFloat = 8
-        let totalBtnWidth = 3 * btnW + 2 * btnGap   // 196
-        let contentWidth = noteW - 24                 // 216
-        let btnStartX: CGFloat = 16 + (contentWidth - totalBtnWidth) / 2
-        let btnY: CGFloat = 11
+        let buttonFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let btnGap: CGFloat = 6
+        let btnPadH: CGFloat = 12   // horizontal padding per button
 
         // Deny uses off-white bg + dark-red text to stand out on the red card
         let denyBg = NSColor(calibratedRed: 0.95, green: 0.93, blue: 0.93, alpha: 1.0)
@@ -1322,29 +1334,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
              NSColor.white),
         ]
 
+        // Compute each button width from its label text
+        let btnWidths: [CGFloat] = buttonDefs.map { def in
+            let textW = (def.title as NSString).size(withAttributes: [.font: buttonFont]).width
+            return ceil(textW) + btnPadH
+        }
+        let totalBtnWidth = btnWidths.reduce(0, +) + CGFloat(buttonDefs.count - 1) * btnGap
+        let contentWidth = noteW - 24
+        let btnStartX: CGFloat = 16 + (contentWidth - totalBtnWidth) / 2
+        let btnH: CGFloat = 24
+        let btnY: CGFloat = 12
+
+        var xCursor = btnStartX
         for (i, def) in buttonDefs.enumerated() {
-            let x = btnStartX + CGFloat(i) * (btnW + btnGap)
-            let container = NSView(frame: NSRect(x: x, y: btnY, width: btnW, height: btnH))
+            let bw = btnWidths[i]
+            let container = NSView(frame: NSRect(x: xCursor, y: btnY, width: bw, height: btnH))
             container.wantsLayer = true
             container.layer?.backgroundColor = def.bgColor.cgColor
             container.layer?.cornerRadius = 5
 
-            let font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            let textSize = (def.title as NSString).size(withAttributes: [.font: font])
+            let textSize = (def.title as NSString).size(withAttributes: [.font: buttonFont])
             let lbl = NSTextField(labelWithString: def.title)
-            lbl.font = font
+            lbl.font = buttonFont
             lbl.textColor = def.textColor
             lbl.alignment = .center
             lbl.drawsBackground = false
             lbl.isBordered = false
             lbl.frame = NSRect(x: 0, y: (btnH - textSize.height) / 2,
-                               width: btnW, height: textSize.height)
+                               width: bw, height: textSize.height)
             container.addSubview(lbl)
 
             let click = NSClickGestureRecognizer(target: self, action: def.action)
             container.addGestureRecognizer(click)
             cardView.addSubview(container)
             approvalButtons.append(container)
+
+            xCursor += bw + btnGap
         }
 
         cardView.closeBtnFrame = closeBtn.frame
