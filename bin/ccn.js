@@ -5,6 +5,8 @@
  * Commands:
  *   ccn init              Configure Claude Code hooks in ~/.claude/settings.json
  *   ccn init --codex      Configure Codex hooks in ~/.codex/
+ *   ccn clean             Remove deprecated cc-notify hooks (keeps active ones)
+ *   ccn clean --codex     Clean deprecated Codex hooks
  *   ccn uninit            Remove cc-notify hooks from settings.json
  *   ccn status            Check installation state
  *   ccn test              Send a test notification
@@ -17,12 +19,14 @@
 'use strict';
 
 const COMMANDS = {
-  init:   () => require('../lib/commands/init'),
-  uninit: () => require('../lib/commands/uninit'),
-  status: () => require('../lib/commands/status'),
-  test:   () => require('../lib/commands/test'),
-  update: () => require('../lib/commands/update'),
-  set:    () => require('../lib/commands/set'),
+  init:             () => require('../lib/commands/init'),
+  clean:            () => require('../lib/commands/clean'),
+  uninit:           () => require('../lib/commands/uninit'),
+  status:           () => require('../lib/commands/status'),
+  test:             () => require('../lib/commands/test'),
+  update:           () => require('../lib/commands/update'),
+  set:              () => require('../lib/commands/set'),
+  'approval-server': () => require('../lib/commands/approval-server'),
 };
 
 const VERSION = require('../package.json').version;
@@ -72,6 +76,10 @@ COMMANDS
     --codex           Configure Codex hooks in ~/.codex/hooks.json and enable
                       features.codex_hooks in ~/.codex/config.toml
     --all             Configure both Claude Code and Codex
+  clean             Remove all cc-notify hooks added by ccn init
+                    Cleans both Claude Code and Codex hooks by default
+    --codex           Clean only Codex hooks
+    --claude          Clean only Claude Code hooks
   uninit            Remove cc-notify hooks from ~/.claude/settings.json
     --codex           Remove only cc-notify hooks from ~/.codex/hooks.json
     --all             Remove cc-notify hooks from both providers
@@ -84,6 +92,10 @@ COMMANDS
   set [key=value]   Manage ~/.cc-notify/env.json config
     (no args)         Show current config
     key=value         Set a config value (dot notation supported)
+  approval-server   Manage the local approval HTTP server
+    (no args)         Show server status (pid, port, uptime)
+    start             Start the server manually
+    stop              Stop the server immediately
 
 CONFIG KEYS
   close_timeout     Auto-close after N seconds of inactivity (default: 10800)
@@ -93,6 +105,8 @@ EXAMPLES
   ccn init
   ccn init --codex
   ccn init --all
+  ccn clean
+  ccn clean --codex
   ccn set close_timeout=300
   ccn set close_timeout=86400
   ccn test

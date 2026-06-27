@@ -263,8 +263,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isCollapsed = false
     var isUrgent = false   // true when content starts with __URGENT__
     var storedMetaLines: [String] = []
-    var noteW: CGFloat = 225
-    let noteH: CGFloat = 102
+    var noteW: CGFloat = 240
+    let noteH: CGFloat = 80
     var dividerView: NSView!
     var resizeHandle: ResizeHandleView!
     // Auto-close timer: restarted on every content update
@@ -275,8 +275,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isApproval = false
     var approvalData: [String: Any]?
     var approvalFilePath: String = ""
-    var approvalButtons: [NSButton] = []
+    var approvalButtons: [NSView] = []
     var approvalButtonsDisabled = false
+
+    // ── Current state (working | completed | approval) ──────────────────────
+    var currentState: String = "working"
+    var lastNormalState: String = "working"   // last non-approval state (for restore)
+    var contentLabel: PassthroughLabel!
+
+    // ── Pre-approval state saved for restoration ────────────────────────────
+    var preApprovalState: String = ""
+    var preApprovalHeaderText: String = ""
+    var preApprovalIsUrgent: Bool = false
+    var preApprovalContentText: String = ""
 
     // ── Theme colors — switch on isUrgent ─────────────────────────────────
     var cardBgColor: NSColor {
@@ -335,9 +346,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Write PID file so notify.sh can detect this running instance
-        let pid = ProcessInfo.processInfo.processIdentifier
-        try? String(pid).write(toFile: pidFilePath, atomically: true, encoding: .utf8)
+        // PID file is now written in main() before app.run() — see bottom of file.
+        // This eliminates a race condition where concurrent processes
+        // (notify.sh / approval-server.js) might launch duplicate windows
+        // before applicationDidFinishLaunching has a chance to run.
 
         // NSScreen.screens[0] 始终是主屏幕（菜单栏所在屏幕），
         // 而 NSScreen.main 会随键盘焦点动态变化，不可靠
@@ -476,12 +488,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dividerView.layer?.backgroundColor = NSColor.clear.cgColor
         cardView.addSubview(dividerView)
 
+        // Content label — single line showing status text (hidden during approval)
+        contentLabel = PassthroughLabel(labelWithString: "")
+        contentLabel.frame = NSRect(x: 16, y: 12, width: noteW - 24, height: 24)
+        contentLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        contentLabel.textColor = .clear   // set by applyTheme()
+        contentLabel.alignment = .center
+        contentLabel.lineBreakMode = .byTruncatingTail
+        cardView.addSubview(contentLabel)
+
         // Right-edge resize handle (meta area only, avoids header buttons)
         resizeHandle = ResizeHandleView(
             frame: NSRect(x: noteW - 4, y: 0, width: 4, height: rowY - 4))
         resizeHandle.onDrag = { [weak self] delta in
             guard let self = self else { return }
-            let minW: CGFloat = 180
+            let minW: CGFloat = 225
             let maxW: CGFloat = 600
             let newW = max(minW, min(maxW, self.noteW - delta))
             guard abs(newW - self.noteW) > 0.5 else { return }
@@ -490,10 +511,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         cardView.addSubview(resizeHandle)
 
-        // Load initial content from file — this sets isUrgent before applyTheme
-        let initialText = (try? String(contentsOfFile: contentFilePath, encoding: .utf8)) ?? ""
-        updateLabels(from: initialText)
-        applyTheme()  // apply colors after isUrgent is resolved from content
+        // Load initial content — reloadContent() handles both __URGENT__ and
+        // __APPROVAL__ modes.  Important when the sticky note was closed earlier
+        // in the session and a new approval request triggers a fresh Swift process:
+        // the content file already has __APPROVAL__ at launch time.
+        reloadContent()
 
         // Watch content file for in-place updates when notify.sh writes new content.
         // setupFileWatcher() also handles inode changes (atomic writes that replace the file).
@@ -625,6 +647,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return result.trimmingCharacters(in: .whitespaces)
     }
 
+    // ── State → icon / status text mappings (hardcoded) ─────────────────
+    func iconForState(_ state: String) -> String {
+        switch state {
+        case "working":   return "⏳"
+        case "completed": return "✅"
+        case "approval":  return "🔐"
+        default:          return "📌"
+        }
+    }
+
+    func statusTextForState(_ state: String) -> String {
+        switch state {
+        case "working":   return "Working…"
+        case "completed": return "Completed"
+        case "approval":  return "Permission Required"
+        default:          return "Active"
+        }
+    }
+
     func debugLog(_ msg: String) {
         let path = "/tmp/cc-sticky-notify/focus-debug.log"
         let ts = ISO8601DateFormatter().string(from: Date())
@@ -652,7 +693,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               let requestId = approvalData?["requestId"] as? String,
               !approvalButtonsDisabled else { return }
         approvalButtonsDisabled = true
-        for btn in approvalButtons { btn.isEnabled = false }
+        for v in approvalButtons { v.alphaValue = 0.4 }
         guard let url = URL(string: endpoint) else { return }
         var body: [String: String] = ["requestId": requestId, "decision": decision]
         if let msg = message { body["message"] = msg }
@@ -666,18 +707,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 if let httpResp = resp as? HTTPURLResponse {
                     if httpResp.statusCode == 200 {
-                        self.exitApprovalMode(statusText: decision == "deny" ? "🚫 Denied" : "✅ Approved")
+                        self.exitApprovalMode(restoreSaved: true)
                     } else if httpResp.statusCode == 409 {
-                        self.exitApprovalMode(statusText: "Already decided")
+                        self.exitApprovalMode(restoreSaved: true)
                     } else if httpResp.statusCode == 404 {
-                        self.exitApprovalMode(statusText: "Request not found")
+                        self.exitApprovalMode(restoreSaved: true)
                     } else {
                         self.cardView?.showTooltip("Error: \(httpResp.statusCode)", locationInWindow: NSPoint(x: 50, y: 30))
                     }
                 } else if error != nil {
                     if self.approvalButtonsDisabled {
                         self.approvalButtonsDisabled = false
-                        for btn in self.approvalButtons { btn.isEnabled = true }
+                        for v in self.approvalButtons { v.alphaValue = 1.0 }
                     }
                     self.cardView?.showTooltip("Network error — try again", locationInWindow: NSPoint(x: 50, y: 30))
                 }
@@ -686,10 +727,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         task.resume()
     }
 
-    @objc func approvalAllowAction()  { postDecision("allow") }
-    @objc func approvalDenyAction()   { postDecision("deny", message: "Denied from sticky note") }
-    @objc func approvalAlwaysAction()  { postDecision("allow_always") }
-    @objc func approvalFocusAction()  { focusTerminal() }
+    @objc func approvalAllowAction(_ sender: Any? = nil)  { guard !approvalButtonsDisabled else { return }; postDecision("allow") }
+    @objc func approvalDenyAction(_ sender: Any? = nil)   { guard !approvalButtonsDisabled else { return }; postDecision("deny", message: "Denied from sticky note") }
+    @objc func approvalAlwaysAction(_ sender: Any? = nil)  { guard !approvalButtonsDisabled else { return }; postDecision("allow_always") }
+    @objc func approvalFocusAction(_ sender: Any? = nil)  { guard !approvalButtonsDisabled else { return }; focusTerminal() }
 
     func focusTerminal() {
         debugLog("--- focusTerminal called ---")
@@ -886,20 +927,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func reloadContent() {
         guard let text = try? String(contentsOfFile: contentFilePath, encoding: .utf8) else { return }
-        updateLabels(from: text)
-        // Check for approval mode
-        if text.hasPrefix("__APPROVAL__") && !isApproval {
-            if let approvalRaw = try? String(contentsOfFile: approvalFilePath, encoding: .utf8),
-               let approvalObj = try? JSONSerialization.jsonObject(with: Data(approvalRaw.utf8)) as? [String: Any] {
-                approvalData = approvalObj
-                enterApprovalMode()
-                return
+
+        // __APPROVAL__ content: enter approval mode, or stay in it.
+        // Must return early — NEVER parse __APPROVAL__ as normal content.
+        if text.hasPrefix("__APPROVAL__") {
+            if !isApproval {
+                if let approvalRaw = try? String(contentsOfFile: approvalFilePath, encoding: .utf8),
+                   let approvalObj = try? JSONSerialization.jsonObject(with: Data(approvalRaw.utf8)) as? [String: Any] {
+                    approvalData = approvalObj
+                    enterApprovalMode()
+                } else {
+                    // Approval JSON not ready yet — retry after a short delay
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.reloadContent()
+                    }
+                }
             }
-        }
-        if !text.hasPrefix("__APPROVAL__") && isApproval {
-            exitApprovalMode(statusText: text)
             return
         }
+
+        // No longer __APPROVAL__ but was in approval mode → exit and restore
+        if isApproval {
+            exitApprovalMode(restoreSaved: true)
+            return
+        }
+
+        // Normal content — must have __STATE__ marker
+        guard text.contains("__STATE__:") else { return }
+        updateLabels(from: text)
         applyTheme()
         if isCollapsed, let icon = iconLabel {
             // Update circle icon but do NOT auto-expand
@@ -1038,68 +1093,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             isUrgent = false
         }
 
-        storedMetaLines = Array(lines.dropFirst())
-        headerLabel.stringValue = lines.first ?? ""
+        // Parse state from __STATE__:<state> line
+        var parsedState: String = ""
+        var projectName: String = ""
+        storedMetaLines = []
 
-        // Remove stale per-line labels, rebuild fresh
+        for line in lines {
+            if line.hasPrefix("__STATE__:") {
+                let value = line.replacingOccurrences(of: "__STATE__:", with: "").trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { parsedState = value }
+            } else if line.hasPrefix("Project:") {
+                projectName = line.replacingOccurrences(of: "Project:", with: "").trimmingCharacters(in: .whitespaces)
+                storedMetaLines.append(line)
+            } else {
+                storedMetaLines.append(line)
+            }
+        }
+
+        currentState = parsedState.isEmpty ? "working" : parsedState
+        // Track last non-approval state: when the urgent Notification hook fires
+        // before the approval hook, currentState is "approval" but the real
+        // pre-approval state was whatever came before (usually "working").
+        if currentState != "approval" {
+            lastNormalState = currentState
+        }
+
+        // Build header: icon + project name
+        let icon = iconForState(currentState)
+        headerLabel.stringValue = projectName.isEmpty ? icon : "\(icon) \(projectName)"
+
+        // Set single-line content
+        contentLabel.stringValue = statusTextForState(currentState)
+
+        // Remove stale meta line labels (no longer rendered)
         for lbl in metaLineLabels { lbl.removeFromSuperview() }
         metaLineLabels.removeAll()
 
-        // Meta area geometry
-        let metaAreaY: CGFloat = 8
-        let metaAreaH: CGFloat = noteH - 28 - 16   // rowY - 16
-        let lineH:     CGFloat = 15
-        let lineStep:  CGFloat = 18                 // lineH + 3pt gap
-
-        let ps = NSMutableParagraphStyle()
-        ps.tabStops = [NSTextTab(textAlignment: .left, location: 58)]
-        ps.lineBreakMode = .byTruncatingTail
-
-        for (i, origLine) in storedMetaLines.enumerated() {
-            let lineY = metaAreaY + metaAreaH - lineH - CGFloat(i) * lineStep
-            guard lineY >= metaAreaY - 2 else { break }
-
-            // "Time: 14:30" → "Time:\t14:30"
-            let displayLine: String
-            if let idx = origLine.firstIndex(of: ":") {
-                let key   = String(origLine[...idx])
-                let value = origLine[origLine.index(after: idx)...].trimmingCharacters(in: .whitespaces)
-                displayLine = "\(key)\t\(value)"
-            } else {
-                displayLine = origLine
-            }
-
-            let label = PassthroughLabel(labelWithString: "")
-            label.frame = NSRect(x: 16, y: lineY, width: noteW - 24, height: lineH)
-            label.isBordered = false
-            label.drawsBackground = false
-            label.lineBreakMode = .byTruncatingTail
-            label.isHidden = isCollapsed
-
-            let baseAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: metaNormalColor,
-                .paragraphStyle: ps
-            ]
-            if displayLine.hasPrefix("Project:"), let tabIdx = displayLine.firstIndex(of: "\t") {
-                let attrStr = NSMutableAttributedString(
-                    string: String(displayLine[...tabIdx]), attributes: baseAttrs)
-                attrStr.append(NSAttributedString(
-                    string: String(displayLine[displayLine.index(after: tabIdx)...]),
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                        .foregroundColor: metaProjectValColor,
-                        .paragraphStyle: ps
-                    ]))
-                label.attributedStringValue = attrStr
-            } else {
-                label.attributedStringValue = NSAttributedString(
-                    string: displayLine, attributes: baseAttrs)
-            }
-
-            metaLineLabels.append(label)
-            cardView.addSubview(label)
-        }
         updateTooltips()
     }
 
@@ -1121,10 +1150,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         closeBtn.frame     = NSRect(x: w - 26, y: rowY,     width: 20, height: 20)
         dividerView.frame  = NSRect(x: 16, y: rowY - 4,     width: w - 24, height: 1)
         resizeHandle.frame = NSRect(x: w - 4, y: 0,         width: 4, height: rowY - 4)
-
-        for label in metaLineLabels {
-            label.frame.size.width = w - 24
-        }
+        contentLabel.frame = NSRect(x: 16, y: 42,           width: w - 24, height: 24)
 
         cardView.closeBtnFrame = closeBtn.frame
         cardView.contentFrame  = NSRect(x: 16, y: 8, width: w - 24, height: noteH - 16)
@@ -1168,17 +1194,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // ── Meta lines ──────────────────────────────────────────────────────
-        for (i, label) in metaLineLabels.enumerated() {
-            guard i < storedMetaLines.count else { break }
-            let attrStr = label.attributedStringValue
-            guard attrStr.length > 0 else { continue }
-            let naturalW = attrStr.boundingRect(
-                with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: 20),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).width
-            if naturalW > label.frame.width {
-                zones.append((label.frame, storedMetaLines[i]))
+        // ── Content label ────────────────────────────────────────────────────
+        let contentText = contentLabel.stringValue
+        if !contentText.isEmpty, let font = contentLabel.font {
+            let naturalW = (contentText as NSString)
+                .size(withAttributes: [.font: font]).width
+            if naturalW > contentLabel.frame.width {
+                zones.append((contentLabel.frame, contentText))
             }
         }
 
@@ -1213,43 +1235,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Divider line
         dividerView.layer?.backgroundColor = dividerColor.cgColor
 
-        // Rebuild meta line label colors
-        let ps = NSMutableParagraphStyle()
-        ps.tabStops = [NSTextTab(textAlignment: .left, location: 58)]
-        ps.lineBreakMode = .byTruncatingTail
-
-        for (i, label) in metaLineLabels.enumerated() {
-            guard i < storedMetaLines.count else { break }
-            let origLine = storedMetaLines[i]
-            let displayLine: String
-            if let idx = origLine.firstIndex(of: ":") {
-                let key   = String(origLine[...idx])
-                let value = origLine[origLine.index(after: idx)...].trimmingCharacters(in: .whitespaces)
-                displayLine = "\(key)\t\(value)"
-            } else {
-                displayLine = origLine
-            }
-            let baseAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: metaNormalColor,
-                .paragraphStyle: ps
-            ]
-            if displayLine.hasPrefix("Project:"), let tabIdx = displayLine.firstIndex(of: "\t") {
-                let attrStr = NSMutableAttributedString(
-                    string: String(displayLine[...tabIdx]), attributes: baseAttrs)
-                attrStr.append(NSAttributedString(
-                    string: String(displayLine[displayLine.index(after: tabIdx)...]),
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                        .foregroundColor: metaProjectValColor,
-                        .paragraphStyle: ps
-                    ]))
-                label.attributedStringValue = attrStr
-            } else {
-                label.attributedStringValue = NSAttributedString(
-                    string: displayLine, attributes: baseAttrs)
-            }
-        }
+        // Content label
+        contentLabel.textColor = headerTextColor
 
         // If currently collapsed, update the circle border color too
         if isCollapsed {
@@ -1258,99 +1245,119 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func enterApprovalMode() {
-        guard let data = approvalData else { return }
+        guard approvalData != nil else { return }
+
+        // Save pre-approval state for restoration
+        preApprovalState = lastNormalState
+        preApprovalHeaderText = headerLabel.stringValue
+        preApprovalIsUrgent = isUrgent
+        preApprovalContentText = contentLabel.stringValue
+
         isApproval = true
+        approvalButtonsDisabled = false
         closeTimer?.invalidate()
         closeTimer = nil
-        cardView.layer?.backgroundColor = NSColor(calibratedRed: 0.94, green: 0.96, blue: 1.0, alpha: 1.0).cgColor
 
-        let toolName = data["toolName"] as? String ?? ""
-        let summary  = data["summary"] as? String ?? ""
-        let provider = data["provider"] as? String ?? "claude"
-        let providerName = provider == "codex" ? "Codex" : "Claude Code"
-        headerLabel.stringValue = "🔐 \(providerName) Approval"
+        // Use urgent-red background (same as --urgent); temporarily set isUrgent
+        // so cardBgColor / headerTextColor / … resolve to the red theme.
+        isUrgent = true
+        cardView.layer?.backgroundColor = cardBgColor.cgColor
+        headerLabel.textColor = headerTextColor
+        collapseBtn.attributedTitle = NSAttributedString(string: "▾", attributes: [
+            .foregroundColor: closeBtnColor,
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium)
+        ])
+        closeBtn.attributedTitle = NSAttributedString(string: "✕", attributes: [
+            .foregroundColor: closeBtnColor,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium)
+        ])
+        dividerView.layer?.backgroundColor = dividerColor.cgColor
+        accentBar.followColor = accentFollowColor
+        accentBar.pinnedColor = accentPinnedColor
+        accentBar.isFollowing = accentBar.isFollowing
 
+        // Hide content label; buttons replace it
+        contentLabel.isHidden = true
+
+        // Clean up any stale meta line labels
         for lbl in metaLineLabels { lbl.removeFromSuperview() }
         metaLineLabels.removeAll()
 
-        let metaAreaY: CGFloat = 8
-        let metaAreaH: CGFloat = noteH - 28 - 16
-        let lineH: CGFloat = 15
+        // ── Horizontal button row: Allow / Deny / Always ─────────────────
+        let btnW: CGFloat = 60
+        let btnH: CGFloat = 26
+        let btnGap: CGFloat = 8
+        let totalBtnWidth = 3 * btnW + 2 * btnGap   // 196
+        let contentWidth = noteW - 24                 // 216
+        let btnStartX: CGFloat = 16 + (contentWidth - totalBtnWidth) / 2
+        let btnY: CGFloat = 11
 
-        let toolLabel = PassthroughLabel(labelWithString: "Tool: \(toolName)")
-        toolLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 36, width: noteW - 140, height: lineH)
-        toolLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        toolLabel.textColor = NSColor(calibratedRed: 0.15, green: 0.20, blue: 0.30, alpha: 1.0)
-        toolLabel.lineBreakMode = .byTruncatingTail
-        cardView.addSubview(toolLabel)
-        metaLineLabels.append(toolLabel)
+        // Deny uses off-white bg + dark-red text to stand out on the red card
+        let denyBg = NSColor(calibratedRed: 0.95, green: 0.93, blue: 0.93, alpha: 1.0)
+        let denyText = NSColor(calibratedRed: 0.55, green: 0.08, blue: 0.08, alpha: 1.0)
 
-        let summaryLabel = PassthroughLabel(labelWithString: summary)
-        summaryLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 54, width: noteW - 140, height: lineH)
-        summaryLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        summaryLabel.textColor = NSColor(calibratedRed: 0.25, green: 0.30, blue: 0.40, alpha: 1.0)
-        summaryLabel.lineBreakMode = .byTruncatingTail
-        cardView.addSubview(summaryLabel)
-        metaLineLabels.append(summaryLabel)
-
-        let projectName = storedMetaLines
-            .first(where: { $0.hasPrefix("Project:") })
-            .flatMap { line -> String? in
-                guard let idx = line.firstIndex(of: ":") else { return nil }
-                return line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
-            } ?? ""
-        if !projectName.isEmpty {
-            let projLabel = PassthroughLabel(labelWithString: "Project: \(projectName)")
-            projLabel.frame = NSRect(x: 16, y: metaAreaY + metaAreaH - lineH - 72, width: noteW - 140, height: lineH)
-            projLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-            projLabel.textColor = NSColor(calibratedRed: 0.40, green: 0.45, blue: 0.55, alpha: 1.0)
-            projLabel.lineBreakMode = .byTruncatingTail
-            cardView.addSubview(projLabel)
-            metaLineLabels.append(projLabel)
-        }
-
-        let btnX = noteW - 130
-        let btnW: CGFloat = 116
-        let btnH: CGFloat = 22
-        let btnGap: CGFloat = 4
-        let buttonBaseY = metaAreaY + 4
-
-        let buttonDefs: [(title: String, action: Selector, color: NSColor)] = [
-            ("Allow",  #selector(approvalAllowAction),  NSColor(calibratedRed: 0.18, green: 0.62, blue: 0.18, alpha: 1.0)),
-            ("Deny",   #selector(approvalDenyAction),   NSColor(calibratedRed: 0.82, green: 0.18, blue: 0.18, alpha: 1.0)),
-            ("Always", #selector(approvalAlwaysAction),  NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.10, alpha: 1.0)),
-            ("Focus",  #selector(approvalFocusAction),   NSColor(calibratedRed: 0.35, green: 0.45, blue: 0.60, alpha: 1.0)),
+        let buttonDefs: [(title: String, action: Selector, bgColor: NSColor, textColor: NSColor)] = [
+            ("Allow",  #selector(approvalAllowAction),
+             NSColor(calibratedRed: 0.18, green: 0.62, blue: 0.18, alpha: 1.0),
+             NSColor.white),
+            ("Deny",   #selector(approvalDenyAction),
+             denyBg, denyText),
+            ("Always", #selector(approvalAlwaysAction),
+             NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.10, alpha: 1.0),
+             NSColor.white),
         ]
 
         for (i, def) in buttonDefs.enumerated() {
-            let btn = NSButton(frame: NSRect(x: btnX, y: buttonBaseY + CGFloat(i) * (btnH + btnGap), width: btnW, height: btnH))
-            btn.title = def.title
-            btn.isBordered = true
-            btn.bezelStyle = .rounded
-            btn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            btn.target = self
-            btn.action = def.action
-            btn.wantsLayer = true
-            btn.layer?.backgroundColor = def.color.cgColor
-            btn.layer?.cornerRadius = 4
-            btn.contentTintColor = NSColor.white
-            cardView.addSubview(btn)
-            approvalButtons.append(btn)
+            let x = btnStartX + CGFloat(i) * (btnW + btnGap)
+            let container = NSView(frame: NSRect(x: x, y: btnY, width: btnW, height: btnH))
+            container.wantsLayer = true
+            container.layer?.backgroundColor = def.bgColor.cgColor
+            container.layer?.cornerRadius = 5
+
+            let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            let textSize = (def.title as NSString).size(withAttributes: [.font: font])
+            let lbl = NSTextField(labelWithString: def.title)
+            lbl.font = font
+            lbl.textColor = def.textColor
+            lbl.alignment = .center
+            lbl.drawsBackground = false
+            lbl.isBordered = false
+            lbl.frame = NSRect(x: 0, y: (btnH - textSize.height) / 2,
+                               width: btnW, height: textSize.height)
+            container.addSubview(lbl)
+
+            let click = NSClickGestureRecognizer(target: self, action: def.action)
+            container.addGestureRecognizer(click)
+            cardView.addSubview(container)
+            approvalButtons.append(container)
         }
 
         cardView.closeBtnFrame = closeBtn.frame
-        cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 154, height: noteH - 16)
+        cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
     }
 
-    func exitApprovalMode(statusText: String) {
+    func exitApprovalMode(statusText: String? = nil, restoreSaved: Bool = false) {
         isApproval = false
         approvalData = nil
         for btn in approvalButtons { btn.removeFromSuperview() }
         approvalButtons.removeAll()
         for lbl in metaLineLabels { lbl.removeFromSuperview() }
         metaLineLabels.removeAll()
-        updateLabels(from: statusText)
-        applyTheme()
+
+        if restoreSaved {
+            // Restore pre-approval state — buttons gone, back to normal
+            currentState = preApprovalState
+            isUrgent = preApprovalIsUrgent
+            headerLabel.stringValue = preApprovalHeaderText
+            contentLabel.isHidden = false
+            contentLabel.stringValue = preApprovalContentText
+            applyTheme()
+        } else if let text = statusText {
+            // Legacy path: parse text as new content
+            updateLabels(from: text)
+            applyTheme()
+        }
+
         cardView.closeBtnFrame = closeBtn.frame
         cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
         scheduleCloseTimer()
@@ -1387,6 +1394,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 let contentFilePath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+// Write PID file BEFORE entering the run loop so that any concurrent process
+// (notify.sh / approval-server.js) can immediately detect this running instance
+// and skip launching a duplicate window.  Eliminates the race where both sides
+// checked the pid file before applicationDidFinishLaunching wrote it.
+let pidFilePath = contentFilePath.hasSuffix(".txt")
+    ? String(contentFilePath.dropLast(4)) + ".pid"
+    : contentFilePath + ".pid"
+try? String(ProcessInfo.processInfo.processIdentifier).write(toFile: pidFilePath, atomically: true, encoding: .utf8)
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // Hide from Dock
 let delegate = AppDelegate(contentFilePath: contentFilePath)

@@ -18,10 +18,19 @@ TIMESTAMP=$(date '+%H:%M:%S')
 PROVIDER="claude"
 URGENT=0
 FORCE=0
+STATE=""
 while true; do
     case "${1:-}" in
         --urgent) URGENT=1; shift ;;
         --force)  FORCE=1;  shift ;;
+        --state)
+            STATE="${2:-working}"
+            shift 2
+            ;;
+        --state=*)
+            STATE="${1#--state=}"
+            shift
+            ;;
         --provider)
             PROVIDER="${2:-claude}"
             shift 2
@@ -33,6 +42,17 @@ while true; do
         *) break ;;
     esac
 done
+
+# Default state: --urgent implies approval; stdin mode implies completed; otherwise working
+if [ -z "$STATE" ]; then
+    if [ "$URGENT" = "1" ]; then
+        STATE="approval"
+    elif [ $# -eq 0 ]; then
+        STATE="completed"
+    else
+        STATE="working"
+    fi
+fi
 
 case "$PROVIDER" in
     claude|codex) ;;
@@ -81,18 +101,14 @@ _log "INVOKE args=[$*] pwd=$(pwd)"
 # shellcheck disable=SC1091
 [ -f "$SKILL_SCRIPTS/env.sh" ] && source "$SKILL_SCRIPTS/env.sh"
 
-_log "SESSION provider=$PROVIDER key=$SESSION_KEY urgent=$URGENT force=$FORCE mode=$([ $# -gt 0 ] && echo 'arg' || echo 'stdin')"
+_log "SESSION provider=$PROVIDER key=$SESSION_KEY urgent=$URGENT force=$FORCE state=$STATE mode=$([ $# -gt 0 ] && echo 'arg' || echo 'stdin')"
 
 if [ $# -gt 0 ]; then
-    # Arg mode: use provided text, append timestamp (Project appended after Source detection)
-    LINES=("$@" "Time: $TIMESTAMP")
+    # Arg mode: use __STATE__ marker (extra args after --state are ignored for content)
+    LINES=("__STATE__:${STATE}" "Time: $TIMESTAMP")
 else
-    # Stdin mode: Stop hook — show completion message
-    if [ "$PROVIDER" = "codex" ]; then
-        LINES=("Codex task completed" "Time: $TIMESTAMP")
-    else
-        LINES=("✅ Claude Code task completed" "Time: $TIMESTAMP")
-    fi
+    # Stdin mode: Stop hook — state already defaults to completed
+    LINES=("__STATE__:${STATE}" "Time: $TIMESTAMP")
 fi
 
 # One window per provider session — use STATE_KEY so cd mid-session doesn't change the path
@@ -218,7 +234,20 @@ if [ "$FORCE" != "1" ]; then
     fi
 fi
 printf '%s' "$SIG" > "$LAST_SIG_FILE"
-_log "CONTENT_WRITE urgent=$URGENT title=${LINES[0]}"
+_log "CONTENT_WRITE urgent=$URGENT state=$STATE"
+
+# Guard: if the content file is already in __APPROVAL__ mode (written by
+# approval-server.js), don't overwrite it.  Both the PermissionRequest hook
+# (approval-hook.js → approval-server.js) and the Notification hook
+# (notify.sh --urgent) fire simultaneously for permission events.
+# The approval flow takes priority — it provides interactive Allow/Deny buttons.
+if [ -f "$CONTENT_FILE" ]; then
+    _first_line=$(head -n 1 "$CONTENT_FILE" 2>/dev/null || true)
+    if [ "$_first_line" = "__APPROVAL__" ]; then
+        _log "SKIP_APPROVAL_ACTIVE (approval mode in progress, won't overwrite)"
+        exit 0
+    fi
+fi
 
 if [ "$URGENT" = "1" ]; then
     { printf '__URGENT__\n'; printf '%s\n' "${LINES[@]}"; } > "$CONTENT_FILE"

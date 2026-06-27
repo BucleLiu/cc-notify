@@ -14,12 +14,12 @@ const SERVER_JS    = path.join(INSTALL_DIR, 'approval-server.js');
 const adapters = {
   claude: {
     buildAllowResponse() { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } }; },
-    buildDenyResponse(message) { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: message || 'Denied from cc-notify' } } }; },
+    buildDenyResponse(message) { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } }; },
     buildNoDecisionResponse() { return null; }
   },
   codex: {
     buildAllowResponse() { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } }; },
-    buildDenyResponse(message) { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: message || 'Denied from cc-notify' } } }; },
+    buildDenyResponse(message) { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } }; },
     buildNoDecisionResponse() { return null; }
   }
 };

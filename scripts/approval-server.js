@@ -76,10 +76,13 @@ function buildSummary(toolName, toolInput) {
 function writeApprovalFiles(provider, sessionId, requestId, toolName, toolInput, cwd, serverPort) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
   const projectName = path.basename(cwd || process.cwd());
-  const contentFile = path.join(TMP_DIR, `${provider}-${sessionId.slice(0, 16)}.txt`);
+  // Normalize sessionId the same way notify.sh does: strip non-alphanumeric chars,
+  // then take first 16 characters. This ensures both use the same content file path.
+  const normalizedSessionId = (sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
+  const contentFile = path.join(TMP_DIR, `${provider}-${normalizedSessionId}.txt`);
   const approvalFile = contentFile.replace(/\.txt$/, '.approval.json');
   const summary = buildSummary(toolName, toolInput);
-  const lines = ['__APPROVAL__', `🔐 ${provider === 'claude' ? 'Claude Code' : 'Codex'} Approval`, `Tool: ${toolName}`, `Summary: ${summary}`, `Project: ${projectName}`];
+  const lines = ['__APPROVAL__', '__STATE__:approval', `Project: ${projectName}`];
   fs.writeFileSync(contentFile, lines.join('\n') + '\n', 'utf8');
   fs.writeFileSync(approvalFile, JSON.stringify({ type: 'approval', requestId, provider, sessionId, toolName, summary, detail: toolInput || {}, decisionEndpoint: `http://127.0.0.1:${serverPort}/decision`, createdAt: new Date().toISOString(), allowAlwaysScope: 'session' }, null, 2) + '\n', 'utf8');
   return { contentFile, approvalFile };
@@ -160,7 +163,7 @@ function handleApproval(req, res) {
     try { parsed = JSON.parse(body); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'invalid JSON' })); return; }
     const { provider, sessionId, toolName, toolInput, cwd } = parsed;
     if (state.pendingRequests.size >= MAX_PENDING) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'too_many_pending' })); return; }
-    const sessionKey = sessionId ? sessionId.slice(0, 16) : 'default';
+    const sessionKey = (sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
     const alwaysMatch = matchAlwaysRule(provider, sessionKey, toolName);
     if (alwaysMatch) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: alwaysMatch.decision, reason: alwaysMatch.reason })); return; }
     const requestId = generateRequestId();
