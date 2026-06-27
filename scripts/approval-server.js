@@ -167,6 +167,7 @@ function handleApproval(req, res) {
     const alwaysMatch = matchAlwaysRule(provider, sessionKey, toolName);
     if (alwaysMatch) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: alwaysMatch.decision, reason: alwaysMatch.reason })); return; }
     const requestId = generateRequestId();
+    const projectName = path.basename(cwd || process.cwd());
     const { contentFile, approvalFile } = writeApprovalFiles(provider, sessionKey, requestId, toolName, toolInput, cwd, state.port);
     launchSwiftWindow(contentFile);
     const timeoutId = setTimeout(() => {
@@ -179,7 +180,30 @@ function handleApproval(req, res) {
         state.pendingRequests.delete(requestId);
       }
     }, APPROVAL_TIMEOUT_MS);
-    state.pendingRequests.set(requestId, { id: requestId, provider, sessionId: sessionKey, toolName, status: 'pending', decision: null, message: null, response: res, contentFile, approvalFile, timeoutId, createdAt: Date.now() });
+    state.pendingRequests.set(requestId, { id: requestId, provider, sessionId: sessionKey, toolName, status: 'pending', decision: null, message: null, response: res, contentFile, approvalFile, timeoutId, projectName, createdAt: Date.now() });
+
+    // When the user approves in the terminal instead of clicking the sticky
+    // note buttons, Claude Code may kill the approval-hook.js process, which
+    // closes this HTTP connection.  Detect the close and clean up so the
+    // sticky note can recover.
+    //
+    // IMPORTANT: listen on res.on('close'), NOT req.on('close').
+    // req (IncomingMessage/Readable stream) emits 'close' immediately after
+    // 'end' when the request body is fully consumed, even though the socket
+    // is still open (keep-alive).  res (ServerResponse/Writable stream) only
+    // emits 'close' when the underlying connection is actually terminated.
+    res.on('close', () => {
+      const pending = state.pendingRequests.get(requestId);
+      if (pending && pending.status === 'pending') {
+        pending.status = 'cancelled';
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+        const projectLine = pending.projectName ? `Project: ${pending.projectName}` : '';
+        updateContentFile(pending.contentFile, `__STATE__:working\n${projectLine}`.trim());
+        cleanupApprovalFiles(pending.approvalFile);
+        state.pendingRequests.delete(requestId);
+      }
+    });
+
     resetIdleTimer();
   });
 }

@@ -127,6 +127,28 @@ function postApproval(port, provider, sessionId, toolName, toolInput, cwd, permi
   });
   req.on('error', () => { emitNoDecision(); });
   req.on('timeout', () => { req.destroy(); emitNoDecision(); });
+
+  // When the user approves in the terminal instead of clicking the sticky
+  // note buttons, CC may close stdout (the pipe CC reads from) or send
+  // SIGTERM to this process.  Detect these signals and abort the HTTP
+  // request — this closes the TCP connection to approval-server, which
+  // triggers res.on('close') and immmediately restores the sticky note
+  // without waiting for PostToolUse or Stop hooks.
+  function abortRequest() {
+    if (aborted) return;
+    aborted = true;
+    try { req.destroy(); } catch (_) {}
+  }
+  let aborted = false;
+
+  // stdout pipe broken: CC has stopped reading our output (user already
+  // decided in the terminal).  This is the fastest and most reliable signal
+  // for command-type hooks.
+  process.stdout.on('error', () => abortRequest());
+
+  // CC may send SIGTERM to clean up hooks it no longer needs.
+  process.on('SIGTERM', () => { abortRequest(); process.exit(0); });
+
   req.write(body);
   req.end();
 }

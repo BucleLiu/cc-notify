@@ -103,6 +103,34 @@ _log "INVOKE args=[$*] pwd=$(pwd)"
 
 _log "SESSION provider=$PROVIDER key=$SESSION_KEY urgent=$URGENT force=$FORCE state=$STATE mode=$([ $# -gt 0 ] && echo 'arg' || echo 'stdin')"
 
+# ── Close state: session ended, kill the sticky note and clean up ──────────────
+if [ "$STATE" = "close" ]; then
+    TMP_DIR="/tmp/cc-notify"
+    CONTENT_FILE="$TMP_DIR/${STATE_KEY}.txt"
+    PID_FILE="$TMP_DIR/${STATE_KEY}.pid"
+
+    if [ -f "$PID_FILE" ]; then
+        _existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+        if [ -n "$_existing_pid" ] && kill -0 "$_existing_pid" 2>/dev/null; then
+            kill "$_existing_pid" 2>/dev/null || true
+            _log "CLOSE killed pid=$_existing_pid"
+        fi
+        rm -f "$PID_FILE" 2>/dev/null
+    fi
+
+    # Clean up all temp files for this session
+    rm -f "$CONTENT_FILE" \
+          "$TMP_DIR/${STATE_KEY}.sig" \
+          "$TMP_DIR/${STATE_KEY}.focus" \
+          "$TMP_DIR/${STATE_KEY}.window" \
+          "$TMP_DIR/${STATE_KEY}.pos" \
+          "$TMP_DIR/${STATE_KEY}.wid" \
+          "$TMP_DIR/${STATE_KEY}.slot" \
+          2>/dev/null
+    _log "CLOSE cleaned up temp files"
+    exit 0
+fi
+
 if [ $# -gt 0 ]; then
     # Arg mode: use __STATE__ marker (extra args after --state are ignored for content)
     LINES=("__STATE__:${STATE}" "Time: $TIMESTAMP")
@@ -237,15 +265,28 @@ printf '%s' "$SIG" > "$LAST_SIG_FILE"
 _log "CONTENT_WRITE urgent=$URGENT state=$STATE"
 
 # Guard: if the content file is already in __APPROVAL__ mode (written by
-# approval-server.js), don't overwrite it.  Both the PermissionRequest hook
-# (approval-hook.js → approval-server.js) and the Notification hook
-# (notify.sh --urgent) fire simultaneously for permission events.
-# The approval flow takes priority — it provides interactive Allow/Deny buttons.
+# approval-server.js), don't overwrite it — UNLESS the current state is
+# "completed" (Stop hook) or "working" (subsequent hook after terminal approval).
+#
+# Background: when the user approves in the terminal instead of clicking the
+# sticky note buttons, Claude Code kills the approval-hook.js process and
+# continues the task.  The next time notify.sh is called (Stop hook or any
+# subsequent event), the content file still has __APPROVAL__ from before.
+# Allowing completed/working states to overwrite __APPROVAL__ lets the sticky
+# note recover from the stale approval mode and display the real current state.
+#
+# Urgent/approval states still respect the guard: the Notification hook
+# (--urgent) fires in parallel with the PermissionRequest hook, and the
+# approval flow (interactive buttons) takes priority in that case.
 if [ -f "$CONTENT_FILE" ]; then
     _first_line=$(head -n 1 "$CONTENT_FILE" 2>/dev/null || true)
     if [ "$_first_line" = "__APPROVAL__" ]; then
-        _log "SKIP_APPROVAL_ACTIVE (approval mode in progress, won't overwrite)"
-        exit 0
+        if [ "$STATE" = "completed" ] || [ "$STATE" = "working" ]; then
+            _log "OVERRIDE_APPROVAL state=$STATE (terminal approval detected, restoring sticky note)"
+        else
+            _log "SKIP_APPROVAL_ACTIVE (approval mode in progress, won't overwrite)"
+            exit 0
+        fi
     fi
 fi
 

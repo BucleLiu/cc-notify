@@ -956,6 +956,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard text.contains("__STATE__:") else { return }
         updateLabels(from: text)
         applyTheme()
+
+        // ── Auto-collapse/expand by state ────────────────────────────────────
+        // When the task is actively working, the sticky note collapses into a
+        // compact circle so it doesn't distract.  Non-working states (completed,
+        // approval) expand the note back so the result is visible at a glance.
+        let isActive = (currentState == "working")
+        if isActive && !isCollapsed {
+            collapseWindowAction()
+        } else if !isActive && isCollapsed {
+            expandWindow()
+        }
+
         if isCollapsed, let icon = iconLabel {
             // Update circle icon but do NOT auto-expand
             icon.stringValue = extractIcon(from: headerLabel.stringValue)
@@ -1253,6 +1265,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preApprovalIsUrgent = isUrgent
         preApprovalContentText = contentLabel.stringValue
 
+        // If collapsed, expand so the user can see and interact with the buttons
+        if isCollapsed { expandWindow() }
+
         isApproval = true
         approvalButtonsDisabled = false
         closeTimer?.invalidate()
@@ -1352,6 +1367,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             contentLabel.isHidden = false
             contentLabel.stringValue = preApprovalContentText
             applyTheme()
+
+            // If the pre-approval state was "working", collapse back to circle
+            if preApprovalState == "working" && !isCollapsed {
+                collapseWindowAction()
+            }
         } else if let text = statusText {
             // Legacy path: parse text as new content
             updateLabels(from: text)
