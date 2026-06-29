@@ -73,9 +73,68 @@ json_get_string() {
     printf '%s' "$HOOK_JSON" | sed -nE 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1
 }
 
+json_get_first_string() {
+    for _json_key in "$@"; do
+        _json_value=$(json_get_string "$_json_key" 2>/dev/null || true)
+        if [ -n "$_json_value" ]; then
+            printf '%s' "$_json_value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+clean_prompt_label() {
+    printf '%s' "$1" \
+        | sed 's/\\n/ /g; s/\\r/ /g; s/\\t/ /g; s/[[:space:]]\{1,\}/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | cut -c 1-28
+}
+
+is_codex_temp_cwd() {
+    [ "$PROVIDER" = "codex" ] || return 1
+    _cwd="$1"
+    _base="$2"
+    case "$_cwd" in
+        /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*|"$HOME"/Documents/Codex/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/*) ;;
+        *) return 1 ;;
+    esac
+    # Codex App sessions without an explicit project can report a short,
+    # random-looking temp/project directory as cwd; avoid showing that as a project.
+    printf '%s' "$_base" | grep -Eq '^[A-Za-z0-9_-]{1,16}$'
+}
+
+resolve_project_label() {
+    _cwd="${PROJECT_CWD:-$(pwd)}"
+    _base=$(basename "$_cwd")
+    _project_file="/tmp/cc-notify/${STATE_KEY}.project"
+    mkdir -p "/tmp/cc-notify" 2>/dev/null || true
+
+    if is_codex_temp_cwd "$_cwd" "$_base"; then
+        _prompt=$(json_get_first_string prompt user_prompt userPrompt message 2>/dev/null || true)
+        _prompt=$(clean_prompt_label "$_prompt")
+        if [ -n "$_prompt" ]; then
+            _label="会话：$_prompt"
+            printf '%s\n' "$_label" > "$_project_file" 2>/dev/null || true
+            printf '%s' "$_label"
+            return 0
+        fi
+        if [ -f "$_project_file" ]; then
+            _saved=$(cat "$_project_file" 2>/dev/null || true)
+            if [ -n "$_saved" ]; then
+                printf '%s' "$_saved"
+                return 0
+            fi
+        fi
+        printf '%s' '会话'
+        return 0
+    fi
+
+    printf '%s' "$_base"
+}
+
 # ── Codex session-end watcher ─────────────────────────────────────────────────
-# Codex has no SessionEnd hook (its hook events are SessionStart /
-# UserPromptSubmit / PreToolUse / PermissionRequest / PostToolUse / Stop only).
+# Codex has no SessionEnd hook (its hook events include UserPromptSubmit /
+# PreToolUse / PermissionRequest / PostToolUse / Stop, but no SessionEnd).
 # Claude Code closes the sticky note via a real SessionEnd hook (see
 # HOOK_DEFINITIONS in lib/commands/init.js). For Codex we instead launch a
 # lightweight background watcher that polls the Codex main process — which is
@@ -124,9 +183,11 @@ ensure_codex_watcher() {
         # Codex exited → close the sticky note for this session.
         "$SKILL_SCRIPTS/notify.sh" --provider codex --state close --session "$SESSION_KEY" >/dev/null 2>&1
         rm -f "$_wf" 2>/dev/null
-    ) & disown
-    printf '%s' "$!" > "$_wf" 2>/dev/null
-    _log "WATCHER start codex_pid=$_codex_pid watcher_pid=$! session=$SESSION_KEY"
+    ) </dev/null >/dev/null 2>&1 &
+    _watcher_pid=$!
+    disown "$_watcher_pid" 2>/dev/null || true
+    printf '%s' "$_watcher_pid" > "$_wf" 2>/dev/null
+    _log "WATCHER start codex_pid=$_codex_pid watcher_pid=$_watcher_pid session=$SESSION_KEY"
 }
 
 # Always read session/cwd from hook JSON when stdin is piped.
@@ -161,7 +222,7 @@ fi
 
 SESSION_KEY="${SESSION_KEY_OVERRIDE:-${SESSION_SHORT:-default}}"
 STATE_KEY="${PROVIDER}-${SESSION_KEY}"
-PROJECT=$(basename "${PROJECT_CWD:-$(pwd)}")
+PROJECT=$(resolve_project_label)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # Record every invocation to ~/.cc-notify/notify.log for debugging.
@@ -204,6 +265,7 @@ if [ "$STATE" = "close" ]; then
           "$TMP_DIR/${STATE_KEY}.window" \
           "$TMP_DIR/${STATE_KEY}.pos" \
           "$TMP_DIR/${STATE_KEY}.wid" \
+          "$TMP_DIR/${STATE_KEY}.project" \
           "$TMP_DIR/${STATE_KEY}.slot" \
           2>/dev/null
     _log "CLOSE cleaned up temp files"

@@ -73,12 +73,39 @@ function buildSummary(toolName, toolInput) {
   return `${toolName}: ${keys.join(', ')}`;
 }
 
+function isCodexTempCwd(provider, cwd) {
+  if (provider !== 'codex' || !cwd) return false;
+  const normalized = String(cwd).replace(/\\/g, '/');
+  const codexScratchRe = new RegExp(`^${escapeRegExp(os.homedir().replace(/\\/g, '/'))}/Documents/Codex/\\d{4}-\\d{2}-\\d{2}/[^/]+$`);
+  if (!normalized.startsWith('/tmp/') &&
+      !normalized.startsWith('/private/tmp/') &&
+      !normalized.startsWith('/var/folders/') &&
+      !normalized.startsWith('/private/var/folders/') &&
+      !codexScratchRe.test(normalized)) return false;
+  return /^[A-Za-z0-9_-]{1,16}$/.test(path.basename(normalized));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function resolveProjectName(provider, sessionId, cwd) {
+  const fallback = path.basename(cwd || process.cwd());
+  if (!isCodexTempCwd(provider, cwd || process.cwd())) return fallback;
+  const projectFile = path.join(TMP_DIR, `${provider}-${sessionId}.project`);
+  try {
+    const saved = fs.readFileSync(projectFile, 'utf8').trim();
+    if (saved) return saved;
+  } catch (_) {}
+  return '会话';
+}
+
 function writeApprovalFiles(provider, sessionId, requestId, toolName, toolInput, cwd, serverPort, toolUseId) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
-  const projectName = path.basename(cwd || process.cwd());
   // Normalize sessionId the same way notify.sh does: strip non-alphanumeric chars,
   // then take first 16 characters. This ensures both use the same content file path.
   const normalizedSessionId = (sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
+  const projectName = resolveProjectName(provider, normalizedSessionId, cwd);
   const contentFile = path.join(TMP_DIR, `${provider}-${normalizedSessionId}.txt`);
   const approvalFile = contentFile.replace(/\.txt$/, '.approval.json');
   const summary = buildSummary(toolName, toolInput);
@@ -167,7 +194,7 @@ function handleApproval(req, res) {
     const alwaysMatch = matchAlwaysRule(provider, sessionKey, toolName);
     if (alwaysMatch) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: alwaysMatch.decision, reason: alwaysMatch.reason })); return; }
     const requestId = generateRequestId();
-    const projectName = path.basename(cwd || process.cwd());
+    const projectName = resolveProjectName(provider, sessionKey, cwd);
     const { contentFile, approvalFile } = writeApprovalFiles(provider, sessionKey, requestId, toolName, toolInput, cwd, state.port, toolUseId);
     launchSwiftWindow(contentFile);
     const timeoutId = setTimeout(() => {

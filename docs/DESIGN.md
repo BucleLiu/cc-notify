@@ -247,9 +247,8 @@ ccn set close_timeout=300
 | `PermissionRequest` | `.*` | `approval-hook.js --provider codex`（`timeout: 600`） | 🔐 真审批 |
 | `UserPromptSubmit` | — | `notify.sh --provider codex --state working` | ⏳ 工作中 |
 | `PostToolUse` | — | `notify.sh --provider codex --state working` | ⏳ 工作中 |
-| `SessionStart` | `startup\|resume` | `notify.sh --provider codex --urgent --state completed` | ✅ 会话启动/恢复 |
 
-> **退出会话关闭便签**：Claude Code 有真正的 `SessionEnd` hook（见上表）直接 `--state close`。Codex 的 hook 事件只有 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `Stop`，**没有 SessionEnd**。因此 Codex 的"退出关闭"由 `notify.sh` 内的 `ensure_codex_watcher` 实现：每次 Codex hook 调用（非 close 状态）时，沿进程树向上找到 Codex 主进程（`comm` 为 `codex` 的最上层祖先），启动一个轻量后台 watcher 每 5s 轮询该 PID；PID 消失（Codex 退出）即调用 `notify.sh --provider codex --state close --session <key>` 关闭并清理对应会话的便签。watcher 按 `<provider>-<session>.watcher` 文件去重，同一会话只保留一个；找不到 Codex 祖先（手动调用/测试）时跳过，退化为 Swift app 的空闲自动关闭（`CC_STICKY_NOTIFY_CLOSE_TIMEOUT`）兜底。该机制对 Claude Code 零影响（`ensure_codex_watcher` 仅在 `--provider codex` 时生效）。
+> **退出会话关闭便签**：Claude Code 有真正的 `SessionEnd` hook（见上表）直接 `--state close`。Codex 的 hook 事件包含 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PermissionRequest` / `PostToolUse` / `Stop`，但**没有 SessionEnd**。因此 Codex 的"退出关闭"由 `notify.sh` 内的 `ensure_codex_watcher` 实现：每次 Codex hook 调用（非 close 状态）时，沿进程树向上找到 Codex 主进程（`comm` 为 `codex` 的最上层祖先），启动一个轻量后台 watcher 每 5s 轮询该 PID；PID 消失（Codex 退出）即调用 `notify.sh --provider codex --state close --session <key>` 关闭并清理对应会话的便签。watcher 按 `<provider>-<session>.watcher` 文件去重，同一会话只保留一个；找不到 Codex 祖先（手动调用/测试）时跳过，退化为 Swift app 的空闲自动关闭（`CC_STICKY_NOTIFY_CLOSE_TIMEOUT`）兜底。该机制对 Claude Code 零影响（`ensure_codex_watcher` 仅在 `--provider codex` 时生效）。
 
 所有 hook 命令引用 `$HOME/.cc-notify/` 下的稳定路径（`notify.sh` / `approval-hook.js`），npm 更新后通常无需重新运行 `ccn init`。
 
