@@ -20,7 +20,8 @@ const adapters = {
   codex: {
     buildAllowResponse() { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } }; },
     buildDenyResponse(message) { return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } }; },
-    buildNoDecisionResponse() { return null; }
+    // Codex expects "{}" (not empty stdout) to fall back to native approval.
+    buildNoDecisionResponse() { return {}; }
   }
 };
 
@@ -36,20 +37,53 @@ else if (process.argv.some(a => a.startsWith('--provider=codex'))) provider = 'c
 const adapter = adapters[provider];
 if (!adapter) { process.exit(1); }
 
+// Resolve a stable session key shared with notify.sh, so the approval sticky
+// note and subsequent notification sticky note reuse the same window.
+// Codex's session_id can be empty; we extract the UUID from transcript_path
+// (rollout-...-<uuid>.jsonl), falling back to session_id / turn_id.
+// Claude Code's transcript_path doesn't match the rollout pattern, so CC
+// falls through to session_id — behavior unchanged.
+function extractUuidFromTranscript(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || !transcriptPath.trim()) return '';
+  const fileName = path.basename(transcriptPath.replace(/\\/g, '/'));
+  const m = fileName.match(/^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return m ? m[1] : '';
+}
+
+function resolveSessionKey(sessionId, transcriptPath, turnId) {
+  const raw = extractUuidFromTranscript(transcriptPath)
+         || (typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : '')
+         || (typeof turnId === 'string' && turnId.trim() ? turnId.trim() : '')
+         || 'default';
+  return raw.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
+}
+
 let stdinData = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { stdinData += chunk; });
 process.stdin.on('end', () => {
   let hookPayload;
   try { hookPayload = JSON.parse(stdinData); } catch { process.exit(0); }
-  const sessionId = hookPayload.session_id || hookPayload.sessionId || '';
+
+  // Defensive event check: a non-PermissionRequest event shouldn't reach this
+  // hook, but reject it explicitly rather than treating it as an approval.
+  const eventName = hookPayload.hook_event_name || hookPayload.hookEventName || '';
+  if (eventName && eventName !== 'PermissionRequest') { emitNoDecision(); return; }
+
+  const transcriptPath = hookPayload.transcript_path || hookPayload.transcriptPath || '';
+  const sessionId = resolveSessionKey(
+    hookPayload.session_id || hookPayload.sessionId || '',
+    transcriptPath,
+    hookPayload.turn_id || hookPayload.turnId || ''
+  );
   const toolName  = hookPayload.tool_name || '';
   const toolInput = hookPayload.tool_input || {};
   const cwd       = hookPayload.cwd || process.cwd();
   const permissionMode = hookPayload.permission_mode || 'default';
+  const toolUseId = hookPayload.tool_use_id || hookPayload.toolUseId || hookPayload.toolUseID || '';
   ensureServerRunning(port => {
     if (!port) { emitNoDecision(); return; }
-    postApproval(port, provider, sessionId, toolName, toolInput, cwd, permissionMode);
+    postApproval(port, provider, sessionId, toolName, toolInput, cwd, permissionMode, toolUseId);
   });
 });
 
@@ -114,8 +148,10 @@ function httpGet(port, path, timeoutMs, cb) {
   req.end();
 }
 
-function postApproval(port, provider, sessionId, toolName, toolInput, cwd, permissionMode) {
-  const body = JSON.stringify({ provider, sessionId, toolName, toolInput, cwd, permissionMode });
+function postApproval(port, provider, sessionId, toolName, toolInput, cwd, permissionMode, toolUseId) {
+  const bodyObj = { provider, sessionId, toolName, toolInput, cwd, permissionMode };
+  if (toolUseId) bodyObj.toolUseId = toolUseId;
+  const body = JSON.stringify(bodyObj);
   const req = http.request({
     hostname: '127.0.0.1', port, path: '/approval', method: 'POST',
     timeout: REQUEST_TIMEOUT_MS,

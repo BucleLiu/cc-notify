@@ -19,6 +19,7 @@ PROVIDER="claude"
 URGENT=0
 FORCE=0
 STATE=""
+SESSION_KEY_OVERRIDE=""
 while true; do
     case "${1:-}" in
         --urgent) URGENT=1; shift ;;
@@ -37,6 +38,14 @@ while true; do
             ;;
         --provider=*)
             PROVIDER="${1#--provider=}"
+            shift
+            ;;
+        --session)
+            SESSION_KEY_OVERRIDE="${2:-}"
+            shift 2
+            ;;
+        --session=*)
+            SESSION_KEY_OVERRIDE="${1#--session=}"
             shift
             ;;
         *) break ;;
@@ -64,23 +73,93 @@ json_get_string() {
     printf '%s' "$HOOK_JSON" | sed -nE 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1
 }
 
+# ── Codex session-end watcher ─────────────────────────────────────────────────
+# Codex has no SessionEnd hook (its hook events are SessionStart /
+# UserPromptSubmit / PreToolUse / PermissionRequest / PostToolUse / Stop only).
+# Claude Code closes the sticky note via a real SessionEnd hook (see
+# HOOK_DEFINITIONS in lib/commands/init.js). For Codex we instead launch a
+# lightweight background watcher that polls the Codex main process — which is
+# an ancestor of this hook process — and runs the close cleanup once it exits.
+ensure_codex_watcher() {
+    [ "$PROVIDER" = "codex" ] || return 0
+    [ "$STATE" = "close" ] && return 0
+
+    # Walk the process tree up to the topmost ancestor whose comm is "codex".
+    # Topmost = the Codex main process, so this works even if Codex forks
+    # worker subprocesses. `ps -o comm=` may return a full path → basename it.
+    local _p=$$ _codex_pid="" _pp _comm _i
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        _comm=$(ps -p "$_p" -o comm= 2>/dev/null | sed 's|.*/||' | tr -d ' ')
+        [ -n "$_comm" ] && [ "$_comm" = "codex" ] && _codex_pid=$_p
+        _pp=$(ps -p "$_p" -o ppid= 2>/dev/null | tr -d ' ')
+        if [ -z "$_pp" ] || [ "$_pp" = "0" ] || [ "$_pp" = "1" ]; then break; fi
+        _p=$_pp
+    done
+    # No Codex ancestor (e.g. manual `notify.sh` invocation, tests) — skip.
+    # The Swift app's idle auto-close (CC_STICKY_NOTIFY_CLOSE_TIMEOUT) still
+    # acts as a fallback.
+    [ -n "$_codex_pid" ] || return 0
+
+    local _td="/tmp/cc-notify"
+    local _wf="$_td/${STATE_KEY}.watcher"
+    # A live watcher is already tracking this session — don't stack another.
+    if [ -f "$_wf" ]; then
+        local _wp
+        _wp=$(cat "$_wf" 2>/dev/null)
+        if [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    mkdir -p "$_td" 2>/dev/null
+    (
+        # Poll until the Codex main process is gone. The comm check guards
+        # against PID reuse by an unrelated process claiming the same PID.
+        while kill -0 "$_codex_pid" 2>/dev/null; do
+            if [ "$(ps -p "$_codex_pid" -o comm= 2>/dev/null | sed 's|.*/||' | tr -d ' ')" != "codex" ]; then
+                break
+            fi
+            sleep 5
+        done
+        # Codex exited → close the sticky note for this session.
+        "$SKILL_SCRIPTS/notify.sh" --provider codex --state close --session "$SESSION_KEY" >/dev/null 2>&1
+        rm -f "$_wf" 2>/dev/null
+    ) & disown
+    printf '%s' "$!" > "$_wf" 2>/dev/null
+    _log "WATCHER start codex_pid=$_codex_pid watcher_pid=$! session=$SESSION_KEY"
+}
+
 # Always read session/cwd from hook JSON when stdin is piped.
 HOOK_JSON=""
 SESSION_SHORT=""
 PROJECT_CWD=""
 if [ ! -t 0 ]; then
     HOOK_JSON=$(cat)
-    for _session_key in session_id sessionId turn_id turnId; do
-        _session_value=$(json_get_string "$_session_key" 2>/dev/null || true)
-        if [ -n "$_session_value" ]; then
-            SESSION_SHORT=$(printf '%s' "$_session_value" | tr -cd '[:alnum:]' | cut -c 1-16)
-            break
+    # 1) Codex: 从 transcript_path 文件名提取 UUID（rollout-...-<uuid>.jsonl）
+    #    approval-hook.js 用同一套算法，保证审批态与通知态复用同一便签窗口。
+    #    Claude Code 的 transcript_path 不匹配 rollout- 前缀 → 走下方 session_id 回退，CC 零影响。
+    _transcript=$(json_get_string transcript_path 2>/dev/null || true)
+    if [ -n "$_transcript" ]; then
+        _tname=$(printf '%s' "$_transcript" | sed 's|\\|/|g' | sed 's|.*/||')
+        _uuid=$(printf '%s' "$_tname" | sed -nE 's/^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/\1/p')
+        if [ -n "$_uuid" ]; then
+            SESSION_SHORT=$(printf '%s' "$_uuid" | tr -cd '[:alnum:]' | cut -c 1-16)
         fi
-    done
+    fi
+    # 2) 回退：session_id / sessionId / turn_id / turnId
+    if [ -z "$SESSION_SHORT" ]; then
+        for _session_key in session_id sessionId turn_id turnId; do
+            _session_value=$(json_get_string "$_session_key" 2>/dev/null || true)
+            if [ -n "$_session_value" ]; then
+                SESSION_SHORT=$(printf '%s' "$_session_value" | tr -cd '[:alnum:]' | cut -c 1-16)
+                break
+            fi
+        done
+    fi
     PROJECT_CWD=$(json_get_string cwd 2>/dev/null || true)
 fi
 
-SESSION_KEY="${SESSION_SHORT:-default}"
+SESSION_KEY="${SESSION_KEY_OVERRIDE:-${SESSION_SHORT:-default}}"
 STATE_KEY="${PROVIDER}-${SESSION_KEY}"
 PROJECT=$(basename "${PROJECT_CWD:-$(pwd)}")
 
@@ -130,6 +209,10 @@ if [ "$STATE" = "close" ]; then
     _log "CLOSE cleaned up temp files"
     exit 0
 fi
+
+# Codex has no SessionEnd hook; start a watcher to close the note when the
+# Codex process exits. No-op for Claude Code (it has a real SessionEnd hook).
+ensure_codex_watcher
 
 if [ $# -gt 0 ]; then
     # Arg mode: use __STATE__ marker (extra args after --state are ignored for content)

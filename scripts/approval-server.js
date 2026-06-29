@@ -73,7 +73,7 @@ function buildSummary(toolName, toolInput) {
   return `${toolName}: ${keys.join(', ')}`;
 }
 
-function writeApprovalFiles(provider, sessionId, requestId, toolName, toolInput, cwd, serverPort) {
+function writeApprovalFiles(provider, sessionId, requestId, toolName, toolInput, cwd, serverPort, toolUseId) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
   const projectName = path.basename(cwd || process.cwd());
   // Normalize sessionId the same way notify.sh does: strip non-alphanumeric chars,
@@ -84,7 +84,7 @@ function writeApprovalFiles(provider, sessionId, requestId, toolName, toolInput,
   const summary = buildSummary(toolName, toolInput);
   const lines = ['__APPROVAL__', '__STATE__:approval', `Project: ${projectName}`];
   fs.writeFileSync(contentFile, lines.join('\n') + '\n', 'utf8');
-  fs.writeFileSync(approvalFile, JSON.stringify({ type: 'approval', requestId, provider, sessionId, toolName, summary, detail: toolInput || {}, decisionEndpoint: `http://127.0.0.1:${serverPort}/decision`, createdAt: new Date().toISOString(), allowAlwaysScope: 'session' }, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(approvalFile, JSON.stringify({ type: 'approval', requestId, provider, sessionId, toolName, toolUseId: toolUseId || null, summary, detail: toolInput || {}, decisionEndpoint: `http://127.0.0.1:${serverPort}/decision`, createdAt: new Date().toISOString(), allowAlwaysScope: 'session' }, null, 2) + '\n', 'utf8');
   return { contentFile, approvalFile };
 }
 
@@ -161,14 +161,14 @@ function handleApproval(req, res) {
   req.on('end', () => {
     let parsed;
     try { parsed = JSON.parse(body); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'invalid JSON' })); return; }
-    const { provider, sessionId, toolName, toolInput, cwd } = parsed;
+    const { provider, sessionId, toolName, toolInput, cwd, toolUseId } = parsed;
     if (state.pendingRequests.size >= MAX_PENDING) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'too_many_pending' })); return; }
     const sessionKey = (sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
     const alwaysMatch = matchAlwaysRule(provider, sessionKey, toolName);
     if (alwaysMatch) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: alwaysMatch.decision, reason: alwaysMatch.reason })); return; }
     const requestId = generateRequestId();
     const projectName = path.basename(cwd || process.cwd());
-    const { contentFile, approvalFile } = writeApprovalFiles(provider, sessionKey, requestId, toolName, toolInput, cwd, state.port);
+    const { contentFile, approvalFile } = writeApprovalFiles(provider, sessionKey, requestId, toolName, toolInput, cwd, state.port, toolUseId);
     launchSwiftWindow(contentFile);
     const timeoutId = setTimeout(() => {
       const p = state.pendingRequests.get(requestId);
@@ -180,7 +180,7 @@ function handleApproval(req, res) {
         state.pendingRequests.delete(requestId);
       }
     }, APPROVAL_TIMEOUT_MS);
-    state.pendingRequests.set(requestId, { id: requestId, provider, sessionId: sessionKey, toolName, status: 'pending', decision: null, message: null, response: res, contentFile, approvalFile, timeoutId, projectName, createdAt: Date.now() });
+    state.pendingRequests.set(requestId, { id: requestId, provider, sessionId: sessionKey, toolName, toolUseId: toolUseId || null, status: 'pending', decision: null, message: null, response: res, contentFile, approvalFile, timeoutId, projectName, createdAt: Date.now() });
 
     // When the user approves in the terminal instead of clicking the sticky
     // note buttons, Claude Code may kill the approval-hook.js process, which

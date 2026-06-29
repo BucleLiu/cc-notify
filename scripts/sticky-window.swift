@@ -576,6 +576,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         iconLabel = icon
         cardView.addSubview(icon)
 
+        // Working state: flip the hourglass end-over-end (upright ↔ inverted)
+        // so the collapsed circle reads as "in progress". We rotate about the
+        // horizontal X axis instead of spinning around Z: the icon's width
+        // never changes and the height only compresses, so the glyph stays
+        // inside the circle at every frame (a Z-axis spin sweeps it outside
+        // the ring). The animation holds briefly on upright and inverted with
+        // a quick flip between, like turning a real hourglass. It lives on
+        // iconLabel's own layer, so it stops automatically when iconLabel is
+        // torn down on expand / app exit. Non-working states keep a static icon.
+        if currentState == "working" {
+            icon.wantsLayer = true
+            let flip = CAKeyframeAnimation(keyPath: "transform.rotation.x")
+            // upright → flip → inverted(hold) → flip back → upright(hold, seamless loop)
+            flip.values = [0.0, Double.pi, Double.pi, 0.0, 0.0]
+            flip.keyTimes = [0.0, 0.35, 0.5, 0.85, 1.0]
+            flip.duration = 2.4
+            flip.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .linear),
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .linear)
+            ]
+            flip.repeatCount = .infinity
+            icon.layer?.add(flip, forKey: "workingFlip")
+        }
+
         // Hide every other subview
         for sub in cardView.subviews where sub !== icon {
             sub.isHidden = true
@@ -1314,7 +1340,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for lbl in metaLineLabels { lbl.removeFromSuperview() }
         metaLineLabels.removeAll()
 
-        // ── Horizontal button row: Allow / Deny / Always ─────────────────
+        // ── Horizontal button row: Allow / Always / Deny ─────────────────
         let buttonFont = NSFont.systemFont(ofSize: 11, weight: .medium)
         let btnGap: CGFloat = 6
         let btnPadH: CGFloat = 12   // horizontal padding per button
@@ -1327,11 +1353,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ("Allow",  #selector(approvalAllowAction),
              NSColor(calibratedRed: 0.18, green: 0.62, blue: 0.18, alpha: 1.0),
              NSColor.white),
-            ("Deny",   #selector(approvalDenyAction),
-             denyBg, denyText),
             ("Always", #selector(approvalAlwaysAction),
              NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.10, alpha: 1.0),
              NSColor.white),
+            ("Deny",   #selector(approvalDenyAction),
+             denyBg, denyText),
         ]
 
         // Compute each button width from its label text
