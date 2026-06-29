@@ -176,10 +176,35 @@ function handleDecision(req, res) {
     if (pending.contentFile) updateContentFile(pending.contentFile, statusText);
     if (pending.approvalFile) cleanupApprovalFiles(pending.approvalFile);
     if (pending.timeoutId) clearTimeout(pending.timeoutId);
+    // Delete now — res.on('close') won't clean this up because pending.status
+    // is 'decided' (not 'pending'), so without this delete every decision
+    // leaves a zombie entry that only a server restart can clear. Zombies
+    // accumulate to MAX_PENDING and then block all new approvals.
+    state.pendingRequests.delete(requestId);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
     resetIdleTimer();
   });
+}
+
+// Reclaim a pending approval slot: reply no_decision to its hook (so the
+// tool call falls back to Claude Code's native approval), clear its timeout,
+// optionally restore the sticky note to working state, and remove it from
+// the map. Used when superseding a stale same-session request or evicting
+// the oldest entry when the pending map is full.
+function cancelPending(pending, reason, { restoreContent = false } = {}) {
+  pending.status = 'cancelled';
+  if (pending.timeoutId) clearTimeout(pending.timeoutId);
+  if (pending.response && !pending.response.writableEnded) {
+    pending.response.writeHead(200, { 'Content-Type': 'application/json' });
+    pending.response.end(JSON.stringify({ decision: 'no_decision', reason }));
+  }
+  if (restoreContent) {
+    const projectLine = pending.projectName ? `Project: ${pending.projectName}` : '';
+    updateContentFile(pending.contentFile, `__STATE__:working\n${projectLine}`.trim());
+  }
+  cleanupApprovalFiles(pending.approvalFile);
+  state.pendingRequests.delete(pending.id);
 }
 
 function handleApproval(req, res) {
@@ -189,10 +214,41 @@ function handleApproval(req, res) {
     let parsed;
     try { parsed = JSON.parse(body); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'invalid JSON' })); return; }
     const { provider, sessionId, toolName, toolInput, cwd, toolUseId } = parsed;
-    if (state.pendingRequests.size >= MAX_PENDING) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: 'no_decision', reason: 'too_many_pending' })); return; }
     const sessionKey = (sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16) || 'default';
     const alwaysMatch = matchAlwaysRule(provider, sessionKey, toolName);
     if (alwaysMatch) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ decision: alwaysMatch.decision, reason: alwaysMatch.reason })); return; }
+
+    // Supersede any prior pending approval for the same session. Claude Code
+    // serializes approvals per session, so a second request for the same
+    // provider+session means the first is stale (resolved in the terminal,
+    // but its connection-close event may not have fired yet to clean it up).
+    // Reclaim its slot instead of letting stale entries accumulate. The new
+    // request reuses the same content file, so no restore is needed.
+    for (const p of state.pendingRequests.values()) {
+      if (p.provider === provider && p.sessionId === sessionKey && p.status === 'pending') {
+        cancelPending(p, 'superseded');
+        break;
+      }
+    }
+
+    // Map full — evict the oldest pending so a new approval is never silently
+    // dropped. The evicted hook gets no_decision (falls back to CC's native
+    // approval) and its sticky note restores to working. After the
+    // decision-delete fix and same-session supersede above, reaching here is
+    // rare; this is pure defense against any remaining accumulation path.
+    if (state.pendingRequests.size >= MAX_PENDING) {
+      let oldest = null;
+      for (const p of state.pendingRequests.values()) {
+        if (p.status === 'pending' && (!oldest || p.createdAt < oldest.createdAt)) oldest = p;
+      }
+      if (!oldest) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ decision: 'no_decision', reason: 'too_many_pending' }));
+        return;
+      }
+      cancelPending(oldest, 'evicted', { restoreContent: true });
+    }
+
     const requestId = generateRequestId();
     const projectName = resolveProjectName(provider, sessionKey, cwd);
     const { contentFile, approvalFile } = writeApprovalFiles(provider, sessionKey, requestId, toolName, toolInput, cwd, state.port, toolUseId);

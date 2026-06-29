@@ -64,6 +64,13 @@ class StickyCardView: NSView {
     var closeBtnFrame: NSRect = .zero
     var contentFrame: NSRect = .zero   // only taps inside this area trigger focus
     var onTap: (() -> Void)?
+    var onDoubleTap: (() -> Void)?       // collapsed circle: double-click → expand card
+    // Whether the card is currently collapsed (circle mode). Read via a closure so
+    // StickyCardView stays decoupled from AppDelegate state.
+    var isCollapsedProvider: () -> Bool = { false }
+    // Defers a single-click action so a fast second click can upgrade it to a
+    // double-click (focus) instead of expanding the circle.
+    private var singleClickTimer: Timer?
     // Use screen-coordinates so that window-drag (isMovableByWindowBackground)
     // doesn't fool the tap detector: when the window tracks the mouse the
     // window-local position stays near-zero even during a real drag.
@@ -77,6 +84,9 @@ class StickyCardView: NSView {
     }
     private var tooltipPanel: NSPanel?
     private var tooltipTimer: Timer?
+    // Text of the tooltip currently waiting on `tooltipTimer` to fire. Lets us
+    // skip resetting the timer on every mouseMoved while hovering the same zone.
+    private var pendingTooltipText: String?
 
     private func needsToUpdateTrackingAreas() {
         // Remove old tracking areas (keep any non-tooltip ones if added later)
@@ -102,8 +112,16 @@ class StickyCardView: NSView {
     private func scheduleTooltip(_ text: String, locationInWindow loc: NSPoint) {
         // Already showing the same tooltip — nothing to do
         if let p = tooltipPanel, p.isVisible, (p.contentView?.subviews.first as? NSTextField)?.stringValue == text { return }
+        // Same tooltip already pending — keep its timer so continuous mouseMoved
+        // events over the same zone don't keep pushing the reveal further out.
+        if pendingTooltipText == text, tooltipTimer != nil { return }
+        pendingTooltipText = text
         tooltipTimer?.invalidate()
-        tooltipTimer = Timer.scheduledTimer(withTimeInterval: 0.55, repeats: false) { [weak self] _ in
+        // Collapsed circle shows only the project name — surface it quickly so
+        // hovering the working badge reveals which session it is right away.
+        let delay: TimeInterval = isCollapsedProvider() ? 0.15 : 0.55
+        tooltipTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            self?.pendingTooltipText = nil
             self?.showTooltip(text, locationInWindow: loc)
         }
     }
@@ -168,6 +186,7 @@ class StickyCardView: NSView {
     func hideTooltip() {
         tooltipTimer?.invalidate()
         tooltipTimer = nil
+        pendingTooltipText = nil
         tooltipPanel?.close()
         tooltipPanel = nil
     }
@@ -187,15 +206,62 @@ class StickyCardView: NSView {
         let dist = hypot(screenPt.x - mouseDownScreenPt.x,
                          screenPt.y - mouseDownScreenPt.y)
         let localPt = convert(event.locationInWindow, from: nil)
-        if dist < 5 && !closeBtnFrame.contains(localPt) && contentFrame.contains(localPt) {
-            onTap?()
+        let isTap = dist < 5 && !closeBtnFrame.contains(localPt) && contentFrame.contains(localPt)
+        if isTap {
+            handleTap(event: event)
+        } else {
+            // Drag or tap outside content — cancel any pending deferred single-click.
+            singleClickTimer?.invalidate()
+            singleClickTimer = nil
         }
         super.mouseUp(with: event)
+    }
+
+    // Single-click vs double-click dispatch.
+    //
+    // Collapsed working circle: single-click focuses the session window,
+    // double-click expands the card. The single-click is deferred so a fast
+    // second click can upgrade to expand instead of focus — this way
+    // brushing the circle doesn't accidentally steal focus.
+    //
+    // Expanded card: single-click focuses immediately (no defer, preserves the
+    // snappy focus behaviour you already have).
+    private func handleTap(event: NSEvent) {
+        let collapsed = isCollapsedProvider()
+
+        // Expanded card, or no double-tap handler wired up: fire single tap at once.
+        guard collapsed, onDoubleTap != nil else {
+            singleClickTimer?.invalidate()
+            singleClickTimer = nil
+            onTap?()
+            return
+        }
+
+        if event.clickCount >= 2 {
+            // Second click arrived within the defer window — upgrade to expand.
+            singleClickTimer?.invalidate()
+            singleClickTimer = nil
+            onDoubleTap?()
+        } else {
+            // Defer the single-click (focus) so a fast second click can upgrade
+            // it to a double-click (expand). Delay tracks the system double-click
+            // threshold + a small margin so the 2nd mouseUp lands before fire.
+            singleClickTimer?.invalidate()
+            let delay = max(NSEvent.doubleClickInterval, 0.25) + 0.05
+            singleClickTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+                self?.singleClickTimer = nil
+                self?.onTap?()
+            }
+        }
     }
 
     // Accept the first mouse-down even when the window is not key,
     // so a single click triggers the tap without first activating the window.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    deinit {
+        singleClickTimer?.invalidate()
+    }
 }
 
 // Right-edge drag handle — lets the user resize the card width.
@@ -529,13 +595,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             selector: #selector(checkInodeChanged),
             userInfo: nil, repeats: true)
 
-        // Tap behaviour: expand when collapsed, or focus terminal when expanded.
+        // Tap behaviour:
+        //   • Expanded card — single-click focuses the session window.
+        //   • Collapsed working circle — single-click focuses the session window;
+        //     double-click expands the card.
         // Urgent theme persists until the next event overwrites the content.
         cardView.closeBtnFrame = closeBtn.frame
         cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
-        cardView.onTap = { [weak self] in
+        cardView.isCollapsedProvider = { [weak self] in self?.isCollapsed ?? false }
+        cardView.onTap = { [weak self] in self?.focusTerminal() }
+        cardView.onDoubleTap = { [weak self] in
             guard let self = self else { return }
-            if self.isCollapsed { self.expandWindow() } else { self.focusTerminal() }
+            if self.isCollapsed { self.expandWindow() }
         }
 
         // orderFrontRegardless 不激活 App，避免系统因焦点变化重新定位窗口
@@ -576,30 +647,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         iconLabel = icon
         cardView.addSubview(icon)
 
-        // Working state: flip the hourglass end-over-end (upright ↔ inverted)
-        // so the collapsed circle reads as "in progress". We rotate about the
-        // horizontal X axis instead of spinning around Z: the icon's width
-        // never changes and the height only compresses, so the glyph stays
-        // inside the circle at every frame (a Z-axis spin sweeps it outside
-        // the ring). The animation holds briefly on upright and inverted with
-        // a quick flip between, like turning a real hourglass. It lives on
-        // iconLabel's own layer, so it stops automatically when iconLabel is
-        // torn down on expand / app exit. Non-working states keep a static icon.
+        // Working state: a gentle in-place opacity "breathing" on the icon so
+        // the collapsed circle reads as "in progress" without flipping or
+        // moving the glyph. We animate opacity rather than rotation so the icon
+        // stays centred inside the ring at every frame. It lives on iconLabel's
+        // own layer, so it stops automatically when iconLabel is torn down on
+        // expand / app exit. Non-working states keep a static icon.
         if currentState == "working" {
             icon.wantsLayer = true
-            let flip = CAKeyframeAnimation(keyPath: "transform.rotation.x")
-            // upright → flip → inverted(hold) → flip back → upright(hold, seamless loop)
-            flip.values = [0.0, Double.pi, Double.pi, 0.0, 0.0]
-            flip.keyTimes = [0.0, 0.35, 0.5, 0.85, 1.0]
-            flip.duration = 2.4
-            flip.timingFunctions = [
+            let breathe = CAKeyframeAnimation(keyPath: "opacity")
+            // visible → dim → visible (seamless loop)
+            breathe.values = [1.0, 0.35, 1.0]
+            breathe.keyTimes = [0.0, 0.5, 1.0]
+            breathe.duration = 1.4
+            breathe.timingFunctions = [
                 CAMediaTimingFunction(name: .easeInEaseOut),
-                CAMediaTimingFunction(name: .linear),
-                CAMediaTimingFunction(name: .easeInEaseOut),
-                CAMediaTimingFunction(name: .linear)
+                CAMediaTimingFunction(name: .easeInEaseOut)
             ]
-            flip.repeatCount = .infinity
-            icon.layer?.add(flip, forKey: "workingFlip")
+            breathe.repeatCount = .infinity
+            icon.layer?.add(breathe, forKey: "workingBreathe")
         }
 
         // Hide every other subview
@@ -968,6 +1034,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let approvalRaw = try? String(contentsOfFile: approvalFilePath, encoding: .utf8),
                    let approvalObj = try? JSONSerialization.jsonObject(with: Data(approvalRaw.utf8)) as? [String: Any] {
                     approvalData = approvalObj
+                    // __APPROVAL__ content bypasses updateLabels (which normally
+                    // fills storedMetaLines from the Project: line). On a freshly
+                    // launched sticky process storedMetaLines is empty, so
+                    // enterApprovalMode() would render the header as just "🔐"
+                    // with no project name. Parse the meta lines from the content
+                    // here so the approval header keeps its project name.
+                    storedMetaLines = text.components(separatedBy: "\n").filter {
+                        !$0.isEmpty && !$0.hasPrefix("__APPROVAL__") && !$0.hasPrefix("__STATE__")
+                    }
                     enterApprovalMode()
                 } else {
                     // Approval JSON not ready yet — retry after a short delay
@@ -991,14 +1066,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         applyTheme()
 
         // ── Auto-collapse/expand by state ────────────────────────────────────
-        // When the task is actively working, the sticky note collapses into a
-        // compact circle so it doesn't distract.  Non-working states (completed,
-        // approval) expand the note back so the result is visible at a glance.
-        let isActive = (currentState == "working")
-        if isActive && !isCollapsed {
+        // "working" and "completed" prefer collapsed (circle) so they don't
+        // distract.  Only "approval" auto-expands (handled in enterApprovalMode).
+        if (currentState == "working" || currentState == "completed") && !isCollapsed {
             collapseWindowAction()
-        } else if !isActive && isCollapsed {
-            expandWindow()
         }
 
         if isCollapsed, let icon = iconLabel {
@@ -1008,6 +1079,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let cs: CGFloat = 44
             let lw = max(icon.frame.width, 28), lh = max(icon.frame.height, 28)
             icon.frame = NSRect(x: (cs - lw) / 2, y: (cs - lh) / 2, width: lw, height: lh)
+
+            // Completed: remove the working "breathing" animation so the ✅
+            // icon is static — the task is done, not in progress.
+            if currentState != "working" {
+                icon.layer?.removeAnimation(forKey: "workingBreathe")
+            }
         }
         // Reset idle close timer on every content update
         scheduleCloseTimer()
@@ -1031,22 +1108,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let easeIn  = CAMediaTimingFunction(name: .easeIn)
         let easeOut = CAMediaTimingFunction(name: .easeOut)
+        let easeInOut = CAMediaTimingFunction(name: .easeInEaseOut)
 
         if isCollapsed {
-            // Circle: shrink-first pulse + border ring brightens
+            // Circle: shrink-first pulse + border ring brightens.
+            // Completed pulses stronger and longer than working so the result
+            // is noticeable even when the card stays folded.
+            let isCompleted = (currentState == "completed")
+
+            // ── Completed: position orbit bounce ──────────────────────────
+            // The circle does a quick zigzag orbit around its centre point,
+            // making the completed event hard to miss even in collapsed mode.
+            if isCompleted {
+                let orbit = CAKeyframeAnimation(keyPath: "position")
+                orbit.isAdditive = true
+                let d: CGFloat = 7.0
+                orbit.values = [
+                    NSValue(point: NSPoint.zero),              // centre
+                    NSValue(point: NSPoint(x: -d, y: d)),       // top-left
+                    NSValue(point: NSPoint(x:  d, y: d)),       // top-right
+                    NSValue(point: NSPoint(x:  d, y: -d)),      // bottom-right
+                    NSValue(point: NSPoint(x: -d, y: -d)),      // bottom-left
+                    NSValue(point: NSPoint(x: -d, y: 0)),       // left
+                    NSValue(point: NSPoint(x:  d, y: 0)),       // right
+                    NSValue(point: NSPoint.zero),              // back to centre
+                ]
+                orbit.keyTimes    = [0, 0.07, 0.18, 0.30, 0.42, 0.55, 0.68, 1.0]
+                orbit.duration    = 1.65   // matches scale total (0.55 × 3)
+                orbit.timingFunctions = [
+                    easeOut, easeInOut, easeInOut,
+                    easeInOut, easeInOut, easeInOut, easeIn,
+                ]
+                orbit.isRemovedOnCompletion = true
+                layer.add(orbit, forKey: "updateOrbit")
+            }
+
             let pulse = CAKeyframeAnimation(keyPath: "transform.scale")
-            pulse.values      = [1.0, 0.82, 1.0, 0.92, 1.0]
-            pulse.keyTimes    = [0,   0.25, 0.5, 0.75, 1.0]
-            pulse.duration    = isUrgent ? 0.30 : 0.40
-            pulse.repeatCount = isUrgent ? 3 : 2
+            pulse.values      = isCompleted
+                ? [1.0, 0.76, 1.0, 0.88, 1.0, 0.94, 1.0]
+                : [1.0, 0.82, 1.0, 0.92, 1.0]
+            pulse.keyTimes    = isCompleted
+                ? [0,   0.16, 0.33, 0.50, 0.66, 0.83, 1.0]
+                : [0,   0.25, 0.50, 0.75, 1.0]
+            pulse.duration    = isUrgent ? 0.30 : (isCompleted ? 0.55 : 0.40)
+            pulse.repeatCount = isUrgent ? 3 : (isCompleted ? 3 : 2)
             pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layer.add(pulse, forKey: "updatePulse")
 
             let curW = layer.borderWidth
             let bw = CAKeyframeAnimation(keyPath: "borderWidth")
-            bw.values          = [curW, curW + (isUrgent ? 4.0 : 2.5), curW]
-            bw.keyTimes        = [0,    0.15,                            1.0]
-            bw.duration        = 1.0
+            let glowAmount: CGFloat = isUrgent ? 4.0 : (isCompleted ? 3.5 : 2.5)
+            bw.values          = [curW, curW + glowAmount, curW]
+            bw.keyTimes        = [0,    0.15,              1.0]
+            bw.duration        = isCompleted ? 1.3 : 1.0
             bw.timingFunctions = [easeIn, easeOut]
             bw.isRemovedOnCompletion = true
             layer.add(bw, forKey: "updateGlow")
@@ -1419,8 +1533,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             contentLabel.stringValue = preApprovalContentText
             applyTheme()
 
-            // If the pre-approval state was "working", collapse back to circle
-            if preApprovalState == "working" && !isCollapsed {
+            // If the pre-approval state was "working" or "completed", collapse back
+            // to circle.  Only approval auto-expands; everything else stays folded.
+            if (preApprovalState == "working" || preApprovalState == "completed") && !isCollapsed {
                 collapseWindowAction()
             }
         } else if let text = statusText {
@@ -1451,12 +1566,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cardView?.hideTooltip()
         inodeCheckTimer?.invalidate()
         fileWatchSource?.cancel()
+        let base = contentFilePath.hasSuffix(".txt")
+            ? String(contentFilePath.dropLast(4))
+            : contentFilePath
+        try? FileManager.default.removeItem(atPath: contentFilePath)
         try? FileManager.default.removeItem(atPath: pidFilePath)
+        try? FileManager.default.removeItem(atPath: base + ".sig")
         try? FileManager.default.removeItem(atPath: focusFilePath)
         try? FileManager.default.removeItem(atPath: windowFilePath)
         try? FileManager.default.removeItem(atPath: posFilePath)
         try? FileManager.default.removeItem(atPath: widFilePath)
         try? FileManager.default.removeItem(atPath: slotFilePath)
+        try? FileManager.default.removeItem(atPath: base + ".project")
+        try? FileManager.default.removeItem(atPath: approvalFilePath)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

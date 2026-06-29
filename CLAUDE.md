@@ -69,6 +69,9 @@ ccn uninit
 ccn uninit --codex
 ccn uninit --all
 
+# 更新安装文件（修改 notify.sh / sticky-window.swift 后运行）
+ccn update --recompile
+
 # 查看/修改运行时配置
 ccn set
 ccn set close_timeout=300

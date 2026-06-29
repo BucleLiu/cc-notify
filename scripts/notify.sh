@@ -137,15 +137,40 @@ resolve_project_label() {
 # PreToolUse / PermissionRequest / PostToolUse / Stop, but no SessionEnd).
 # Claude Code closes the sticky note via a real SessionEnd hook (see
 # HOOK_DEFINITIONS in lib/commands/init.js). For Codex we instead launch a
-# lightweight background watcher that polls the Codex main process — which is
-# an ancestor of this hook process — and runs the close cleanup once it exits.
+# SINGLE lightweight background watcher that polls the Codex main process.
+#
+# Design: one watcher per Codex instance, NOT per session.  Sessions register
+# themselves in /tmp/cc-notify/_codex_sessions; when the watcher detects Codex
+# has exited, it calls --state close for every registered session at once.
+# This avoids accumulating watcher processes across sessions.
 ensure_codex_watcher() {
     [ "$PROVIDER" = "codex" ] || return 0
     [ "$STATE" = "close" ] && return 0
 
-    # Walk the process tree up to the topmost ancestor whose comm is "codex".
-    # Topmost = the Codex main process, so this works even if Codex forks
-    # worker subprocesses. `ps -o comm=` may return a full path → basename it.
+    local _td="/tmp/cc-notify"
+    local _sessions_file="$_td/_codex_sessions"
+    local _watcher_pid_file="$_td/_codex_watcher.pid"
+    mkdir -p "$_td" 2>/dev/null
+
+    # ── Register this session ──────────────────────────────────────────────
+    if [ -f "$_sessions_file" ]; then
+        if ! grep -qxF "$STATE_KEY" "$_sessions_file" 2>/dev/null; then
+            printf '%s\n' "$STATE_KEY" >> "$_sessions_file"
+        fi
+    else
+        printf '%s\n' "$STATE_KEY" > "$_sessions_file"
+    fi
+
+    # ── Global watcher already running? ────────────────────────────────────
+    if [ -f "$_watcher_pid_file" ]; then
+        local _wp
+        _wp=$(cat "$_watcher_pid_file" 2>/dev/null)
+        if [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # ── Find Codex main process ────────────────────────────────────────────
     local _p=$$ _codex_pid="" _pp _comm _i
     for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         _comm=$(ps -p "$_p" -o comm= 2>/dev/null | sed 's|.*/||' | tr -d ' ')
@@ -159,35 +184,29 @@ ensure_codex_watcher() {
     # acts as a fallback.
     [ -n "$_codex_pid" ] || return 0
 
-    local _td="/tmp/cc-notify"
-    local _wf="$_td/${STATE_KEY}.watcher"
-    # A live watcher is already tracking this session — don't stack another.
-    if [ -f "$_wf" ]; then
-        local _wp
-        _wp=$(cat "$_wf" 2>/dev/null)
-        if [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null; then
-            return 0
-        fi
-    fi
-
-    mkdir -p "$_td" 2>/dev/null
+    # ── Spawn global watcher ───────────────────────────────────────────────
     (
-        # Poll until the Codex main process is gone. The comm check guards
-        # against PID reuse by an unrelated process claiming the same PID.
         while kill -0 "$_codex_pid" 2>/dev/null; do
             if [ "$(ps -p "$_codex_pid" -o comm= 2>/dev/null | sed 's|.*/||' | tr -d ' ')" != "codex" ]; then
                 break
             fi
             sleep 5
         done
-        # Codex exited → close the sticky note for this session.
-        "$SKILL_SCRIPTS/notify.sh" --provider codex --state close --session "$SESSION_KEY" >/dev/null 2>&1
-        rm -f "$_wf" 2>/dev/null
+        # Codex exited → close every registered session
+        if [ -f "$_sessions_file" ]; then
+            while IFS= read -r _sk; do
+                [ -n "$_sk" ] || continue
+                _sid="${_sk#codex-}"
+                "$SKILL_SCRIPTS/notify.sh" --provider codex --state close --session "$_sid" >/dev/null 2>&1
+            done < "$_sessions_file"
+            rm -f "$_sessions_file" 2>/dev/null
+        fi
+        rm -f "$_watcher_pid_file" 2>/dev/null
     ) </dev/null >/dev/null 2>&1 &
-    _watcher_pid=$!
+    local _watcher_pid=$!
     disown "$_watcher_pid" 2>/dev/null || true
-    printf '%s' "$_watcher_pid" > "$_wf" 2>/dev/null
-    _log "WATCHER start codex_pid=$_codex_pid watcher_pid=$_watcher_pid session=$SESSION_KEY"
+    printf '%s' "$_watcher_pid" > "$_watcher_pid_file" 2>/dev/null
+    _log "WATCHER start global codex_pid=$_codex_pid watcher_pid=$_watcher_pid"
 }
 
 # Always read session/cwd from hook JSON when stdin is piped.
@@ -267,6 +286,7 @@ if [ "$STATE" = "close" ]; then
           "$TMP_DIR/${STATE_KEY}.wid" \
           "$TMP_DIR/${STATE_KEY}.project" \
           "$TMP_DIR/${STATE_KEY}.slot" \
+          "$TMP_DIR/${STATE_KEY}.watcher" \
           2>/dev/null
     _log "CLOSE cleaned up temp files"
     exit 0
