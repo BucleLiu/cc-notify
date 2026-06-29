@@ -1,6 +1,6 @@
 {
   "name": "@bucle/cc-notify",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Mac floating sticky-note notifications for Claude Code and Codex events",
   "bin": {
     "ccn": "bin/ccn.js"
