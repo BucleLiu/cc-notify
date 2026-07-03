@@ -64,13 +64,10 @@ class StickyCardView: NSView {
     var closeBtnFrame: NSRect = .zero
     var contentFrame: NSRect = .zero   // only taps inside this area trigger focus
     var onTap: (() -> Void)?
-    var onDoubleTap: (() -> Void)?       // collapsed circle: double-click → expand card
+    var onRightClick: ((NSPoint) -> Void)?   // collapsed circle: right-click → context menu
     // Whether the card is currently collapsed (circle mode). Read via a closure so
     // StickyCardView stays decoupled from AppDelegate state.
     var isCollapsedProvider: () -> Bool = { false }
-    // Defers a single-click action so a fast second click can upgrade it to a
-    // double-click (focus) instead of expanding the circle.
-    private var singleClickTimer: Timer?
     // Use screen-coordinates so that window-drag (isMovableByWindowBackground)
     // doesn't fool the tap detector: when the window tracks the mouse the
     // window-local position stays near-zero even during a real drag.
@@ -208,50 +205,15 @@ class StickyCardView: NSView {
         let localPt = convert(event.locationInWindow, from: nil)
         let isTap = dist < 5 && !closeBtnFrame.contains(localPt) && contentFrame.contains(localPt)
         if isTap {
-            handleTap(event: event)
-        } else {
-            // Drag or tap outside content — cancel any pending deferred single-click.
-            singleClickTimer?.invalidate()
-            singleClickTimer = nil
+            onTap?()
         }
         super.mouseUp(with: event)
     }
 
-    // Single-click vs double-click dispatch.
-    //
-    // Collapsed working circle: single-click focuses the session window,
-    // double-click expands the card. The single-click is deferred so a fast
-    // second click can upgrade to expand instead of focus — this way
-    // brushing the circle doesn't accidentally steal focus.
-    //
-    // Expanded card: single-click focuses immediately (no defer, preserves the
-    // snappy focus behaviour you already have).
-    private func handleTap(event: NSEvent) {
-        let collapsed = isCollapsedProvider()
-
-        // Expanded card, or no double-tap handler wired up: fire single tap at once.
-        guard collapsed, onDoubleTap != nil else {
-            singleClickTimer?.invalidate()
-            singleClickTimer = nil
-            onTap?()
-            return
-        }
-
-        if event.clickCount >= 2 {
-            // Second click arrived within the defer window — upgrade to expand.
-            singleClickTimer?.invalidate()
-            singleClickTimer = nil
-            onDoubleTap?()
-        } else {
-            // Defer the single-click (focus) so a fast second click can upgrade
-            // it to a double-click (expand). Delay tracks the system double-click
-            // threshold + a small margin so the 2nd mouseUp lands before fire.
-            singleClickTimer?.invalidate()
-            let delay = max(NSEvent.doubleClickInterval, 0.25) + 0.05
-            singleClickTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                self?.singleClickTimer = nil
-                self?.onTap?()
-            }
+    // Right-click on collapsed circle → context menu (Expand / Close)
+    override func rightMouseDown(with event: NSEvent) {
+        if isCollapsedProvider() {
+            onRightClick?(convert(event.locationInWindow, from: nil))
         }
     }
 
@@ -260,7 +222,7 @@ class StickyCardView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     deinit {
-        singleClickTimer?.invalidate()
+        // No timers to invalidate — single-click fires immediately.
     }
 }
 
@@ -319,6 +281,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var windowFilePath: String
     var posFilePath: String
     var widFilePath: String
+    var ghosttyTidFilePath: String
+    var ghosttyTtyFilePath: String
     var closeBtn: NSButton!
     var collapseBtn: NSButton!
     var accentBar: AccentBarView!
@@ -409,6 +373,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.widFilePath   = base + ".wid"
         self.slotFilePath  = base + ".slot"
         self.approvalFilePath = base + ".approval.json"
+        self.ghosttyTidFilePath = base + ".ghostty-tid"
+        self.ghosttyTtyFilePath = base + ".ghostty-tty"
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -597,16 +563,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Tap behaviour:
         //   • Expanded card — single-click focuses the session window.
-        //   • Collapsed working circle — single-click focuses the session window;
-        //     double-click expands the card.
+        //   • Collapsed circle — single-click focuses; right-click → context menu
+        //     (Expand / Close).
         // Urgent theme persists until the next event overwrites the content.
         cardView.closeBtnFrame = closeBtn.frame
         cardView.contentFrame = NSRect(x: 16, y: 8, width: noteW - 24, height: noteH - 16)
         cardView.isCollapsedProvider = { [weak self] in self?.isCollapsed ?? false }
         cardView.onTap = { [weak self] in self?.focusTerminal() }
-        cardView.onDoubleTap = { [weak self] in
-            guard let self = self else { return }
-            if self.isCollapsed { self.expandWindow() }
+        cardView.onRightClick = { [weak self] loc in
+            self?.showCollapsedContextMenu(at: loc, in: self?.cardView)
         }
 
         // orderFrontRegardless 不激活 App，避免系统因焦点变化重新定位窗口
@@ -628,6 +593,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Hide any visible tooltip first.
     // Keeps cardView as contentView — avoids borderless-window contentView-swap bugs.
     @objc func collapseWindowAction() {
+        guard !isApproval else { return }
         guard !isCollapsed else { return }
         isCollapsed = true
         cardView.hideTooltip()
@@ -666,6 +632,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ]
             breathe.repeatCount = .infinity
             icon.layer?.add(breathe, forKey: "workingBreathe")
+        }
+        if currentState == "completed" {
+            // Gentle scale pulse: a calm "done" heartbeat, slower and steadier
+            // than working's opacity breath. Paired with a green border to
+            // communicate success at a glance.
+            icon.wantsLayer = true
+            let pulse = CAKeyframeAnimation(keyPath: "transform.scale")
+            pulse.values = [1.0, 1.07, 1.0]
+            pulse.keyTimes = [0.0, 0.45, 1.0]
+            pulse.duration = 2.2
+            pulse.timingFunctions = [
+                CAMediaTimingFunction(name: .easeInEaseOut),
+                CAMediaTimingFunction(name: .easeInEaseOut)
+            ]
+            pulse.repeatCount = .infinity
+            icon.layer?.add(pulse, forKey: "completedPulse")
+
+            let green = NSColor(calibratedRed: 0.20, green: 0.70, blue: 0.30, alpha: 1.0)
+            cardView.layer?.borderColor = green.cgColor
+
+            // Auto-stop after 60s: completed is "done done", no need to pulse forever
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                guard let self = self, self.currentState == "completed", self.isCollapsed else { return }
+                self.iconLabel?.layer?.removeAnimation(forKey: "completedPulse")
+                self.cardView?.layer?.borderColor = self.accentBar.currentColor.cgColor
+            }
         }
 
         // Hide every other subview
@@ -728,6 +720,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             display: true, animate: false)
         updateTooltips()
     }
+
+    // ── Collapsed-circle right-click context menu ──────────────────────────
+    func showCollapsedContextMenu(at point: NSPoint, in view: NSView?) {
+        guard let view = view else { return }
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Expand", action: #selector(expandFromContextMenu), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Close", action: #selector(closeFromContextMenu), keyEquivalent: ""))
+        menu.popUp(positioning: nil, at: point, in: view)
+    }
+
+    @objc func expandFromContextMenu() { expandWindow() }
+    @objc func closeFromContextMenu()  { NSApp.terminate(nil) }
 
     // Return the first grapheme cluster (emoji or character) from the header.
     func extractIcon(from text: String) -> String {
@@ -844,6 +849,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             $0.executableURL?.lastPathComponent == appName || $0.localizedName == appName
         }) else { debugLog("FAIL: app not found"); return }
         debugLog("app found pid=\(app.processIdentifier)")
+
+        // Ghostty 专用聚焦：terminal ID → TTY → 回退通用匹配
+        if appName.lowercased() == "ghostty" {
+            if focusGhosttyTerminal(app: app) {
+                debugLog("MATCH ghostty: surface focused via terminal ID/TTY")
+                return
+            }
+            debugLog("ghostty focus cascade exhausted, fallback to generic AX match")
+        }
 
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var windowsRef: CFTypeRef?
@@ -979,6 +993,89 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         app.activate(options: [])
     }
 
+    /// Ghostty 专用聚焦：terminal ID → TTY → 回退
+    /// 返回 true 表示已成功聚焦到具体 surface，false 表示需要走通用兜底
+    func focusGhosttyTerminal(app: NSRunningApplication) -> Bool {
+        // ── L1: Terminal ID 匹配（最精准，surface 级）──────────────────────
+        if let tid = try? String(contentsOfFile: ghosttyTidFilePath, encoding: .utf8) {
+            let trimmed = tid.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let script = """
+                tell application "Ghostty"
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            repeat with term in terminals of t
+                                if id of term is "\(trimmed)" then
+                                    focus term
+                                    return "ok-id"
+                                end if
+                            end repeat
+                        end repeat
+                    end repeat
+                end tell
+                return ""
+                """
+                let proc = Process()
+                proc.launchPath = "/usr/bin/osascript"
+                proc.arguments = ["-e", script]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = FileHandle.nullDevice
+                proc.launch()
+                proc.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if result == "ok-id" {
+                    app.activate(options: [])
+                    debugLog("ghostty L1: terminal ID match ✓")
+                    return true
+                }
+                debugLog("ghostty L1: terminal ID not found (result=\(result))")
+            }
+        }
+
+        // ── L2: TTY 匹配（ID 缺失时的备用，surface 级）───────────────────
+        if let tty = try? String(contentsOfFile: ghosttyTtyFilePath, encoding: .utf8) {
+            let trimmed = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                let script = """
+                tell application "Ghostty"
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            repeat with term in terminals of t
+                                if tty of term ends with "\(trimmed)" then
+                                    focus term
+                                    return "ok-tty"
+                                end if
+                            end repeat
+                        end repeat
+                    end repeat
+                end tell
+                return ""
+                """
+                let proc = Process()
+                proc.launchPath = "/usr/bin/osascript"
+                proc.arguments = ["-e", script]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = FileHandle.nullDevice
+                proc.launch()
+                proc.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if result == "ok-tty" {
+                    app.activate(options: [])
+                    debugLog("ghostty L2: TTY match ✓")
+                    return true
+                }
+                debugLog("ghostty L2: TTY not found (result=\(result))")
+            }
+        }
+
+        debugLog("ghostty: all cascade levels exhausted, fallback to generic")
+        return false
+    }
+
     /// Create (or re-create) the kqueue DispatchSource that watches the content file.
     /// kqueue monitors a file descriptor (inode), not a path — if the file is replaced
     /// (atomic write = tmp + rename), the old fd becomes stale and no events fire.
@@ -1080,10 +1177,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let lw = max(icon.frame.width, 28), lh = max(icon.frame.height, 28)
             icon.frame = NSRect(x: (cs - lw) / 2, y: (cs - lh) / 2, width: lw, height: lh)
 
-            // Completed: remove the working "breathing" animation so the ✅
-            // icon is static — the task is done, not in progress.
-            if currentState != "working" {
-                icon.layer?.removeAnimation(forKey: "workingBreathe")
+            // Manage per-state collapsed-circle animations
+            icon.layer?.removeAnimation(forKey: "workingBreathe")
+            icon.layer?.removeAnimation(forKey: "completedPulse")
+
+            if currentState == "working" {
+                icon.wantsLayer = true
+                let breathe = CAKeyframeAnimation(keyPath: "opacity")
+                breathe.values = [1.0, 0.35, 1.0]
+                breathe.keyTimes = [0.0, 0.5, 1.0]
+                breathe.duration = 1.4
+                breathe.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut)
+                ]
+                breathe.repeatCount = .infinity
+                icon.layer?.add(breathe, forKey: "workingBreathe")
+                cardView.layer?.borderColor = accentBar.currentColor.cgColor
+            } else if currentState == "completed" {
+                icon.wantsLayer = true
+                let pulse = CAKeyframeAnimation(keyPath: "transform.scale")
+                pulse.values = [1.0, 1.07, 1.0]
+                pulse.keyTimes = [0.0, 0.45, 1.0]
+                pulse.duration = 2.2
+                pulse.timingFunctions = [
+                    CAMediaTimingFunction(name: .easeInEaseOut),
+                    CAMediaTimingFunction(name: .easeInEaseOut)
+                ]
+                pulse.repeatCount = .infinity
+                icon.layer?.add(pulse, forKey: "completedPulse")
+
+                let green = NSColor(calibratedRed: 0.20, green: 0.70, blue: 0.30, alpha: 1.0)
+                cardView.layer?.borderColor = green.cgColor
+
+                // Auto-stop after 60s: completed is "done done", no need to pulse forever
+                DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+                    guard let self = self, self.currentState == "completed", self.isCollapsed else { return }
+                    self.iconLabel?.layer?.removeAnimation(forKey: "completedPulse")
+                    self.cardView?.layer?.borderColor = self.accentBar.currentColor.cgColor
+                }
             }
         }
         // Reset idle close timer on every content update
@@ -1449,6 +1581,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Hide content label; buttons replace it
         contentLabel.isHidden = true
+        // Hide collapse button — approval mode must stay expanded for interaction
+        collapseBtn.isHidden = true
 
         // Clean up any stale meta line labels
         for lbl in metaLineLabels { lbl.removeFromSuperview() }
@@ -1530,6 +1664,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             isUrgent = preApprovalIsUrgent
             headerLabel.stringValue = preApprovalHeaderText
             contentLabel.isHidden = false
+            collapseBtn.isHidden = false
             contentLabel.stringValue = preApprovalContentText
             applyTheme()
 
@@ -1577,6 +1712,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: posFilePath)
         try? FileManager.default.removeItem(atPath: widFilePath)
         try? FileManager.default.removeItem(atPath: slotFilePath)
+        try? FileManager.default.removeItem(atPath: ghosttyTidFilePath)
+        try? FileManager.default.removeItem(atPath: ghosttyTtyFilePath)
         try? FileManager.default.removeItem(atPath: base + ".project")
         try? FileManager.default.removeItem(atPath: approvalFilePath)
     }

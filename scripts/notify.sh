@@ -287,6 +287,8 @@ if [ "$STATE" = "close" ]; then
           "$TMP_DIR/${STATE_KEY}.project" \
           "$TMP_DIR/${STATE_KEY}.slot" \
           "$TMP_DIR/${STATE_KEY}.watcher" \
+          "$TMP_DIR/${STATE_KEY}.ghostty-tid" \
+          "$TMP_DIR/${STATE_KEY}.ghostty-tty" \
           2>/dev/null
     _log "CLOSE cleaned up temp files"
     exit 0
@@ -403,6 +405,41 @@ if(project&&(name===project||name.indexOf(project+' ')===0||name.indexOf(project
 if(!fallback){fallback=wid;}}}r||fallback;" 2>/dev/null)
             [ -n "$_wid" ] && printf '%s\n' "$_wid" > "$_widFile"
         fi
+    fi
+fi
+
+# ── Ghostty: capture terminal ID + TTY for surface-level precise focus ─────
+# terminal ID uniquely identifies each split/tab surface; TTY is the fallback
+# match key for the whose-clause in Ghostty AppleScript (tty property can't be
+# coerced to text directly, so ID is captured via AS and TTY via ps on the
+# shell process that sits right before ghostty in the pid chain).
+if [ "$SOURCE_APP" = "ghostty" ] || [ "$SOURCE_APP" = "Ghostty" ]; then
+    GHOSTTY_TID_FILE="$TMP_DIR/${STATE_KEY}.ghostty-tid"
+    GHOSTTY_TTY_FILE="$TMP_DIR/${STATE_KEY}.ghostty-tty"
+    if [ ! -f "$GHOSTTY_TID_FILE" ]; then
+        # Capture terminal ID
+        _tid=$(osascript -e \
+            'tell application "Ghostty" to return id of focused terminal of selected tab of front window' \
+            2>/dev/null)
+        [ -n "$_tid" ] && printf '%s\n' "$_tid" > "$GHOSTTY_TID_FILE"
+
+        # Walk pid chain to find the shell TTY (pid right before ghostty)
+        _prev=""
+        IFS=',' read -ra _pid_arr <<< "$_ancestors"
+        for _p in "${_pid_arr[@]}"; do
+            _comm=$(ps -p "$_p" -o comm= 2>/dev/null | sed 's|.*/||' | tr -d ' ')
+            case "$_comm" in
+                ghostty|Ghostty)
+                    if [ -n "$_prev" ]; then
+                        _tty=$(ps -p "$_prev" -o tty= 2>/dev/null | tr -d ' ')
+                        [ -n "$_tty" ] && printf '%s\n' "$_tty" > "$GHOSTTY_TTY_FILE"
+                    fi
+                    break
+                    ;;
+            esac
+            _prev="$_p"
+        done
+        _log "GHOSTTY tid=$_tid tty=$_tty"
     fi
 fi
 
