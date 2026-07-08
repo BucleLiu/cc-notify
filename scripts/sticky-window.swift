@@ -293,6 +293,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isCollapsed = false
     var isUrgent = false   // true when content starts with __URGENT__
     var storedMetaLines: [String] = []
+    var storedTitle: String = ""
     var noteW: CGFloat = 190
     let noteH: CGFloat = 80
     var dividerView: NSView!
@@ -1433,6 +1434,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if line.hasPrefix("Project:") {
                 projectName = line.replacingOccurrences(of: "Project:", with: "").trimmingCharacters(in: .whitespaces)
                 storedMetaLines.append(line)
+            } else if line.hasPrefix("Title:") {
+                storedTitle = line.replacingOccurrences(of: "Title:", with: "").trimmingCharacters(in: .whitespaces)
             } else {
                 storedMetaLines.append(line)
             }
@@ -1493,8 +1496,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateTooltips() {
         cardView.hideTooltip()
         if isCollapsed {
-            // 折叠时：在整个圆圈区域显示项目名称作为 tooltip
-            // storedMetaLines 存的是原始行，格式 "Project: value"（冒号+空格）
+            // 折叠时：在整个圆圈区域显示"项目名 — 标题"作为 tooltip，
+            // 同一项目的多个会话可以通过标题（用户提示词）区分。
             let projectName = storedMetaLines
                 .first(where: { $0.hasPrefix("Project:") })
                 .flatMap { line -> String? in
@@ -1502,8 +1505,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let value = line[line.index(after: idx)...].trimmingCharacters(in: .whitespaces)
                     return value.isEmpty ? nil : value
                 }
-            if let name = projectName {
-                cardView.tooltipZones = [(rect: cardView.bounds, text: name)]
+            var tooltipText = projectName ?? ""
+            if !storedTitle.isEmpty {
+                tooltipText += " — \(storedTitle)"
+            }
+            if !tooltipText.isEmpty {
+                cardView.tooltipZones = [(rect: cardView.bounds, text: tooltipText)]
             } else {
                 cardView.tooltipZones = []
             }
@@ -1518,7 +1525,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let naturalW = (headerText as NSString)
                 .size(withAttributes: [.font: font]).width
             if naturalW > headerLabel.frame.width {
-                zones.append((headerLabel.frame, headerText))
+                var fullText = headerText
+                if !storedTitle.isEmpty {
+                    fullText += " — \(storedTitle)"
+                }
+                zones.append((headerLabel.frame, fullText))
             }
         }
 
@@ -1752,6 +1763,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: ghosttyTidFilePath)
         try? FileManager.default.removeItem(atPath: ghosttyTtyFilePath)
         try? FileManager.default.removeItem(atPath: base + ".project")
+        try? FileManager.default.removeItem(atPath: base + ".title")
         try? FileManager.default.removeItem(atPath: approvalFilePath)
     }
 

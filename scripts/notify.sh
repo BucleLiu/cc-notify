@@ -90,6 +90,52 @@ clean_prompt_label() {
         | cut -c 1-28
 }
 
+# Extract a human-readable session title from hook JSON (user's prompt).
+# Persisted to .title file so subsequent hooks (PostToolUse, Stop) that
+# don't carry the prompt can still show it in the tooltip.
+resolve_title() {
+    local _title_file="/tmp/cc-notify/${STATE_KEY}.title"
+    mkdir -p "/tmp/cc-notify" 2>/dev/null || true
+
+    # 1) Try to extract prompt from current stdin JSON
+    if [ -n "$HOOK_JSON" ]; then
+        local _raw
+        _raw=$(json_get_first_string prompt user_prompt userPrompt message 2>/dev/null || true)
+        if [ -n "$_raw" ]; then
+            _raw=$(clean_title "$_raw")
+            if [ -n "$_raw" ]; then
+                printf '%s\n' "$_raw" > "$_title_file" 2>/dev/null || true
+                printf '%s' "$_raw"
+                return 0
+            fi
+        fi
+    fi
+
+    # 2) Fallback: read from cached title file
+    if [ -f "$_title_file" ]; then
+        local _saved
+        _saved=$(cat "$_title_file" 2>/dev/null || true)
+        if [ -n "$_saved" ]; then
+            printf '%s' "$_saved"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+clean_title() {
+    local _cleaned
+    _cleaned=$(printf '%s' "$1" \
+        | sed 's/\\n/ /g; s/\\r/ /g; s/\\t/ /g; s/[[:space:]]\{1,\}/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    local _len=${#_cleaned}
+    if [ "$_len" -gt 24 ]; then
+        printf '%s…' "${_cleaned:0:24}"
+    else
+        printf '%s' "$_cleaned"
+    fi
+}
+
 is_codex_temp_cwd() {
     [ "$PROVIDER" = "codex" ] || return 1
     _cwd="$1"
@@ -285,6 +331,7 @@ if [ "$STATE" = "close" ]; then
           "$TMP_DIR/${STATE_KEY}.pos" \
           "$TMP_DIR/${STATE_KEY}.wid" \
           "$TMP_DIR/${STATE_KEY}.project" \
+          "$TMP_DIR/${STATE_KEY}.title" \
           "$TMP_DIR/${STATE_KEY}.slot" \
           "$TMP_DIR/${STATE_KEY}.watcher" \
           "$TMP_DIR/${STATE_KEY}.ghostty-tid" \
@@ -443,9 +490,11 @@ if [ "$SOURCE_APP" = "ghostty" ] || [ "$SOURCE_APP" = "Ghostty" ]; then
     fi
 fi
 
-# Append Source (Time → Source → Project order)
+# Append Source (Time → Source → Project → Title order)
 [ -n "$SOURCE_APP" ] && LINES+=("Source: $SOURCE_APP")
 LINES+=("Project: $PROJECT")
+TITLE=$(resolve_title)
+[ -n "$TITLE" ] && LINES+=("Title: $TITLE")
 
 # Dedup: compute content signature excluding the Time: line
 SIG=""
