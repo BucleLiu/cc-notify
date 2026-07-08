@@ -300,6 +300,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Auto-close timer: restarted on every content update
     var closeTimer: Timer?
     var closeTimeout: Double = 3600
+    var isGhosttyFocusInFlight = false
 
     // ── Approval mode
     var isApproval = false
@@ -852,11 +853,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Ghostty 专用聚焦：terminal ID → TTY → 回退通用匹配
         if appName.lowercased() == "ghostty" {
-            if focusGhosttyTerminal(app: app) {
-                debugLog("MATCH ghostty: surface focused via terminal ID/TTY")
-                return
-            }
-            debugLog("ghostty focus cascade exhausted, fallback to generic AX match")
+            app.activate(options: [])
+            startGhosttySurfaceFocus(app: app)
+            return
         }
 
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
@@ -993,11 +992,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         app.activate(options: [])
     }
 
-    /// Ghostty 专用聚焦：terminal ID → TTY → 回退
-    /// 返回 true 表示已成功聚焦到具体 surface，false 表示需要走通用兜底
-    func focusGhosttyTerminal(app: NSRunningApplication) -> Bool {
+    /// Ghostty 专用聚焦：先立即激活窗口，再后台切到具体 surface。
+    /// AppleScript 偶发耗时数秒，不能阻塞 AppKit 点击回调主线程。
+    func startGhosttySurfaceFocus(app: NSRunningApplication) {
+        guard !isGhosttyFocusInFlight else {
+            debugLog("ghostty focus already in flight, skip duplicate")
+            return
+        }
+        isGhosttyFocusInFlight = true
+
+        let tidPath = ghosttyTidFilePath
+        let ttyPath = ghosttyTtyFilePath
+        let timeout: TimeInterval = 2.5
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak app] in
+            guard let self = self else { return }
+            defer {
+                DispatchQueue.main.async { [weak self] in
+                    self?.isGhosttyFocusInFlight = false
+                }
+            }
+
+            if self.focusGhosttyTerminalById(tidPath: tidPath, timeout: timeout) {
+                DispatchQueue.main.async { app?.activate(options: []) }
+                self.debugLog("MATCH ghostty: surface focused via terminal ID")
+                return
+            }
+
+            if self.focusGhosttyTerminalByTty(ttyPath: ttyPath, timeout: timeout) {
+                DispatchQueue.main.async { app?.activate(options: []) }
+                self.debugLog("MATCH ghostty: surface focused via TTY")
+                return
+            }
+
+            self.debugLog("ghostty: surface focus failed or timed out, app already activated")
+        }
+    }
+
+    func focusGhosttyTerminalById(tidPath: String, timeout: TimeInterval) -> Bool {
         // ── L1: Terminal ID 匹配（最精准，surface 级）──────────────────────
-        if let tid = try? String(contentsOfFile: ghosttyTidFilePath, encoding: .utf8) {
+        if let tid = try? String(contentsOfFile: tidPath, encoding: .utf8) {
             let trimmed = tid.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 let script = """
@@ -1015,27 +1049,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 end tell
                 return ""
                 """
-                let proc = Process()
-                proc.launchPath = "/usr/bin/osascript"
-                proc.arguments = ["-e", script]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = FileHandle.nullDevice
-                proc.launch()
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard let result = runAppleScript(script, timeout: timeout, label: "ghostty L1") else { return false }
                 if result == "ok-id" {
-                    app.activate(options: [])
                     debugLog("ghostty L1: terminal ID match ✓")
                     return true
                 }
                 debugLog("ghostty L1: terminal ID not found (result=\(result))")
             }
         }
+        return false
+    }
 
+    func focusGhosttyTerminalByTty(ttyPath: String, timeout: TimeInterval) -> Bool {
         // ── L2: TTY 匹配（ID 缺失时的备用，surface 级）───────────────────
-        if let tty = try? String(contentsOfFile: ghosttyTtyFilePath, encoding: .utf8) {
+        if let tty = try? String(contentsOfFile: ttyPath, encoding: .utf8) {
             let trimmed = tty.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 let script = """
@@ -1053,27 +1080,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 end tell
                 return ""
                 """
-                let proc = Process()
-                proc.launchPath = "/usr/bin/osascript"
-                proc.arguments = ["-e", script]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = FileHandle.nullDevice
-                proc.launch()
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard let result = runAppleScript(script, timeout: timeout, label: "ghostty L2") else { return false }
                 if result == "ok-tty" {
-                    app.activate(options: [])
                     debugLog("ghostty L2: TTY match ✓")
                     return true
                 }
                 debugLog("ghostty L2: TTY not found (result=\(result))")
             }
         }
-
-        debugLog("ghostty: all cascade levels exhausted, fallback to generic")
         return false
+    }
+
+    func runAppleScript(_ script: String, timeout: TimeInterval, label: String) -> String? {
+        let proc = Process()
+        proc.launchPath = "/usr/bin/osascript"
+        proc.arguments = ["-e", script]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+
+        let semaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in semaphore.signal() }
+        proc.launch()
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            debugLog("\(label): osascript timed out after \(timeout)s")
+            proc.terminate()
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     /// Create (or re-create) the kqueue DispatchSource that watches the content file.
