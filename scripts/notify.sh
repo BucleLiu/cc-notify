@@ -231,36 +231,16 @@ resolve_project_label() {
 # HOOK_DEFINITIONS in lib/commands/init.js). For Codex we instead launch a
 # SINGLE lightweight background watcher that polls the Codex main process.
 #
-# Design: one watcher per Codex instance, NOT per session.  Sessions register
-# themselves in /tmp/cc-notify/_codex_sessions; when the watcher detects Codex
-# has exited, it calls --state close for every registered session at once.
-# This avoids accumulating watcher processes across sessions.
+# Design: one watcher per Codex process, NOT per session. Orca can keep several
+# Codex terminal panes alive at once, and each exits independently. Sessions
+# from a process register in its own file; when that process exits, only its
+# sticky notes are closed.
 ensure_codex_watcher() {
     [ "$PROVIDER" = "codex" ] || return 0
     [ "$STATE" = "close" ] && return 0
 
     local _td="/tmp/cc-notify"
-    local _sessions_file="$_td/_codex_sessions"
-    local _watcher_pid_file="$_td/_codex_watcher.pid"
     mkdir -p "$_td" 2>/dev/null
-
-    # ── Register this session ──────────────────────────────────────────────
-    if [ -f "$_sessions_file" ]; then
-        if ! grep -qxF "$STATE_KEY" "$_sessions_file" 2>/dev/null; then
-            printf '%s\n' "$STATE_KEY" >> "$_sessions_file"
-        fi
-    else
-        printf '%s\n' "$STATE_KEY" > "$_sessions_file"
-    fi
-
-    # ── Global watcher already running? ────────────────────────────────────
-    if [ -f "$_watcher_pid_file" ]; then
-        local _wp
-        _wp=$(cat "$_watcher_pid_file" 2>/dev/null)
-        if [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null; then
-            return 0
-        fi
-    fi
 
     # ── Find Codex main process ────────────────────────────────────────────
     local _p=$$ _codex_pid="" _pp _comm _i
@@ -276,6 +256,28 @@ ensure_codex_watcher() {
     # acts as a fallback.
     [ -n "$_codex_pid" ] || return 0
 
+    local _sessions_file="$_td/_codex_sessions_${_codex_pid}"
+    local _watcher_pid_file="$_td/_codex_watcher_${_codex_pid}.pid"
+
+    # ── Register this session for its owning Codex process ─────────────────
+    if [ -f "$_sessions_file" ]; then
+        if ! grep -qxF "$STATE_KEY" "$_sessions_file" 2>/dev/null; then
+            printf '%s\n' "$STATE_KEY" >> "$_sessions_file"
+        fi
+    else
+        printf '%s\n' "$STATE_KEY" > "$_sessions_file"
+    fi
+
+    # ── This process already has a watcher? ────────────────────────────────
+    if [ -f "$_watcher_pid_file" ]; then
+        local _wp
+        _wp=$(cat "$_watcher_pid_file" 2>/dev/null)
+        if [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$_watcher_pid_file" 2>/dev/null
+    fi
+
     # ── Spawn global watcher ───────────────────────────────────────────────
     (
         while kill -0 "$_codex_pid" 2>/dev/null; do
@@ -284,7 +286,7 @@ ensure_codex_watcher() {
             fi
             sleep 5
         done
-        # Codex exited → close every registered session
+        # Codex exited → close only sessions owned by this Codex process.
         if [ -f "$_sessions_file" ]; then
             while IFS= read -r _sk; do
                 [ -n "$_sk" ] || continue
@@ -298,7 +300,7 @@ ensure_codex_watcher() {
     local _watcher_pid=$!
     disown "$_watcher_pid" 2>/dev/null || true
     printf '%s' "$_watcher_pid" > "$_watcher_pid_file" 2>/dev/null
-    _log "WATCHER start global codex_pid=$_codex_pid watcher_pid=$_watcher_pid"
+    _log "WATCHER start codex_pid=$_codex_pid watcher_pid=$_watcher_pid"
 }
 
 # Always read session/cwd from hook JSON when stdin is piped.
@@ -383,6 +385,7 @@ if [ "$STATE" = "close" ]; then
           "$TMP_DIR/${STATE_KEY}.sig" \
           "$TMP_DIR/${STATE_KEY}.focus" \
           "$TMP_DIR/${STATE_KEY}.focus.json" \
+          "$TMP_DIR/${STATE_KEY}.orca-focus.json" \
           "$TMP_DIR/${STATE_KEY}.window" \
           "$TMP_DIR/${STATE_KEY}.pos" \
           "$TMP_DIR/${STATE_KEY}.wid" \
@@ -424,6 +427,7 @@ CONTENT_FILE="$TMP_DIR/${STATE_KEY}.txt"
 PID_FILE="$TMP_DIR/${STATE_KEY}.pid"
 FOCUS_FILE="$TMP_DIR/${STATE_KEY}.focus"
 FOCUS_TARGET_FILE="$TMP_DIR/${STATE_KEY}.focus.json"
+ORCA_FOCUS_FILE="$TMP_DIR/${STATE_KEY}.orca-focus.json"
 
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
@@ -444,6 +448,26 @@ write_focus_target() {
     fi
 
     [ -f "$FOCUS_FILE" ] || printf '%s\n' "$SOURCE_APP" > "$FOCUS_FILE"
+}
+
+# Orca assigns every terminal pane a runtime handle.  Unlike a macOS window,
+# this handle can select the exact workspace tab and split leaf through
+# `orca terminal focus`; persist it when the hook runs so the sticky note can
+# make the same precise jump later.
+write_orca_focus_target() {
+    [ "$ORCA_SESSION" = "1" ] || return 0
+    [ -n "${ORCA_TERMINAL_HANDLE:-}" ] || return 0
+    [ -f "$ORCA_FOCUS_FILE" ] && return 0
+
+    _orca_handle=$(json_escape "$ORCA_TERMINAL_HANDLE")
+    _orca_pane=$(json_escape "${ORCA_PANE_KEY:-}")
+    _orca_worktree=$(json_escape "${ORCA_WORKTREE_ID:-}")
+    _orca_tmp="${ORCA_FOCUS_FILE}.$$"
+    if printf '{"terminalHandle":"%s","paneKey":"%s","worktreeId":"%s"}\n' \
+        "$_orca_handle" "$_orca_pane" "$_orca_worktree" > "$_orca_tmp" 2>/dev/null; then
+        mv -f "$_orca_tmp" "$ORCA_FOCUS_FILE" 2>/dev/null
+        _log "ORCA_FOCUS_CAPTURE handle=$ORCA_TERMINAL_HANDLE pane=${ORCA_PANE_KEY:-}"
+    fi
 }
 
 resolve_running_app_name() {
@@ -571,6 +595,7 @@ elif [ -z "$SOURCE_APP" ] && [ "$ORCA_SESSION" = "1" ]; then
 fi
 
 write_focus_target
+write_orca_focus_target
 
 # ── Ghostty: capture terminal ID + TTY for surface-level precise focus ─────
 # terminal ID uniquely identifies each split/tab surface; TTY is the fallback

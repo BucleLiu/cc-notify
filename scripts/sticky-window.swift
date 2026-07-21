@@ -279,6 +279,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var metaLineLabels: [PassthroughLabel] = []
     var focusFilePath: String
     var focusTargetFilePath: String
+    var orcaFocusFilePath: String
     var windowFilePath: String
     var posFilePath: String
     var widFilePath: String
@@ -372,6 +373,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.pidFilePath   = base + ".pid"
         self.focusFilePath = base + ".focus"
         self.focusTargetFilePath = base + ".focus.json"
+        self.orcaFocusFilePath = base + ".orca-focus.json"
         self.windowFilePath = base + ".window"
         self.posFilePath   = base + ".pos"
         self.widFilePath   = base + ".wid"
@@ -853,6 +855,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return (appName, bundleId)
     }
 
+    func readOrcaTerminalHandle() -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: orcaFocusFilePath)),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let handle = object["terminalHandle"] as? String,
+              !handle.isEmpty else {
+            return nil
+        }
+        return handle
+    }
+
+    /// Orca's CLI delegates to its runtime, which reveals both the workspace
+    /// and the exact terminal split for a runtime-issued terminal handle.
+    /// This is more precise than AX window matching, because all workspaces
+    /// are rendered inside the same Electron window.
+    func focusOrcaTerminal(app: NSRunningApplication, handle: String) -> Bool {
+        guard let bundleURL = app.bundleURL else { return false }
+        let cliURL = bundleURL.appendingPathComponent("Contents/Resources/bin/orca")
+        guard FileManager.default.isExecutableFile(atPath: cliURL.path) else {
+            debugLog("orca: CLI not found at \(cliURL.path)")
+            return false
+        }
+
+        app.activate(options: [])
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let task = Process()
+            task.executableURL = cliURL
+            task.arguments = ["terminal", "focus", "--terminal", handle, "--json"]
+            task.standardOutput = Pipe()
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+                self?.debugLog("orca: terminal focus handle=\(handle) status=\(task.terminationStatus)")
+            } catch {
+                self?.debugLog("orca: terminal focus launch failed: \(error.localizedDescription)")
+            }
+        }
+        return true
+    }
+
     func focusTerminal() {
         debugLog("--- focusTerminal called ---")
         let target = readFocusTarget()
@@ -874,6 +916,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         })
         guard let app else { debugLog("FAIL: app not found"); return }
         debugLog("app found pid=\(app.processIdentifier)")
+
+        // Orca has one Electron window for many workspaces/terminal splits.
+        // Use its runtime handle before the generic AX window strategies.
+        if bundleId == "com.stablyai.orca", let handle = readOrcaTerminalHandle(),
+           focusOrcaTerminal(app: app, handle: handle) {
+            return
+        }
 
         // Ghostty 专用聚焦：terminal ID → TTY → 回退通用匹配
         if appName.lowercased() == "ghostty" {
@@ -1780,6 +1829,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: base + ".sig")
         try? FileManager.default.removeItem(atPath: focusFilePath)
         try? FileManager.default.removeItem(atPath: focusTargetFilePath)
+        try? FileManager.default.removeItem(atPath: orcaFocusFilePath)
         try? FileManager.default.removeItem(atPath: windowFilePath)
         try? FileManager.default.removeItem(atPath: posFilePath)
         try? FileManager.default.removeItem(atPath: widFilePath)

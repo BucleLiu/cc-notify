@@ -175,6 +175,7 @@ notify.sh
   ├── [4] 走进程树（ps，最多 12 层）找所有祖先 PID
   ├── [5] osascript → System Events：获取 GUI App 名/窗口标题/坐标
   ├── [6] osascript -l JavaScript → CGWindowID 精确捕获
+  ├── [6.5] Orca 场景：保存 ORCA_TERMINAL_HANDLE（以及 pane/worktree 元数据）
   ├── [7] 内容去重：对比 .sig 文件（Time 行不参与比对）
   │        └── 内容相同 → exit 0（静默跳过，避免刷屏）
   ├── [8] 写通知内容到 /tmp/cc-notify/${SESSION_KEY}.txt
@@ -196,6 +197,7 @@ notify.sh
   │        ├── urgent 状态：dismissUrgent() 解除紧急样式
   │        ├── 折叠状态：expandWindow()
   │        └── 展开状态：focusTerminal() 跳回触发的终端窗口
+  │                Orca：`orca terminal focus --terminal <handle>` 精确打开工作区、tab 与 split pane
   │                focusTerminal 四级定位策略：
   │                  策略0: CGWindowID 精确匹配（最准确）
   │                  策略1: 标题 + 位置组合匹配
