@@ -278,6 +278,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var headerLabel: PassthroughLabel!
     var metaLineLabels: [PassthroughLabel] = []
     var focusFilePath: String
+    var focusTargetFilePath: String
     var windowFilePath: String
     var posFilePath: String
     var widFilePath: String
@@ -370,6 +371,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             : contentFilePath
         self.pidFilePath   = base + ".pid"
         self.focusFilePath = base + ".focus"
+        self.focusTargetFilePath = base + ".focus.json"
         self.windowFilePath = base + ".window"
         self.posFilePath   = base + ".pos"
         self.widFilePath   = base + ".wid"
@@ -773,9 +775,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func debugLog(_ msg: String) {
-        let path = "/tmp/cc-sticky-notify/focus-debug.log"
+        let directory = "/tmp/cc-sticky-notify"
+        let path = directory + "/focus-debug.log"
         let ts = ISO8601DateFormatter().string(from: Date())
         let line = "[\(ts)] \(msg)\n"
+        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         if let h = FileHandle(forWritingAtPath: path) {
             h.seekToEndOfFile(); h.write(line.data(using: .utf8) ?? Data()); h.closeFile()
         } else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
@@ -838,18 +842,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func approvalAlwaysAction(_ sender: Any? = nil)  { guard !approvalButtonsDisabled else { return }; postDecision("allow_always") }
     @objc func approvalFocusAction(_ sender: Any? = nil)  { guard !approvalButtonsDisabled else { return }; focusTerminal() }
 
+    func readFocusTarget() -> (appName: String, bundleId: String)? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: focusTargetFilePath)),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let appName = object["appName"] as? String ?? ""
+        let bundleId = object["bundleId"] as? String ?? ""
+        guard !appName.isEmpty || !bundleId.isEmpty else { return nil }
+        return (appName, bundleId)
+    }
+
     func focusTerminal() {
         debugLog("--- focusTerminal called ---")
-        guard let raw = try? String(contentsOfFile: focusFilePath, encoding: .utf8) else {
-            debugLog("FAIL: cannot read .focus file"); return
+        let target = readFocusTarget()
+        let legacyAppName: String = {
+            guard let raw = try? String(contentsOfFile: focusFilePath, encoding: .utf8) else { return "" }
+            return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        }()
+        let appName = target?.appName.isEmpty == false ? target!.appName : legacyAppName
+        let bundleId = target?.bundleId ?? ""
+        guard !appName.isEmpty || !bundleId.isEmpty else {
+            debugLog("FAIL: cannot read focus target"); return
         }
-        let appName = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !appName.isEmpty else { debugLog("FAIL: appName empty"); return }
-        debugLog("appName=\(appName)")
+        debugLog("appName=\(appName) bundleId=\(bundleId)")
 
-        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+        let app = NSWorkspace.shared.runningApplications.first(where: {
+            !bundleId.isEmpty && $0.bundleIdentifier == bundleId
+        }) ?? NSWorkspace.shared.runningApplications.first(where: {
             $0.executableURL?.lastPathComponent == appName || $0.localizedName == appName
-        }) else { debugLog("FAIL: app not found"); return }
+        })
+        guard let app else { debugLog("FAIL: app not found"); return }
         debugLog("app found pid=\(app.processIdentifier)")
 
         // Ghostty 专用聚焦：terminal ID → TTY → 回退通用匹配
@@ -1756,6 +1779,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: pidFilePath)
         try? FileManager.default.removeItem(atPath: base + ".sig")
         try? FileManager.default.removeItem(atPath: focusFilePath)
+        try? FileManager.default.removeItem(atPath: focusTargetFilePath)
         try? FileManager.default.removeItem(atPath: windowFilePath)
         try? FileManager.default.removeItem(atPath: posFilePath)
         try? FileManager.default.removeItem(atPath: widFilePath)

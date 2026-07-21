@@ -84,6 +84,52 @@ json_get_first_string() {
     return 1
 }
 
+# Orca runs Codex as an implementation detail of a single terminal pane. Its
+# hook stream can include several short-lived Codex sessions for that pane.
+# Orca exposes ORCA_PANE_KEY specifically to identify the originating pane,
+# which is stable across those sessions and distinct for same-workspace panes.
+is_orca_codex_session() {
+    [ "$PROVIDER" = "codex" ] || return 1
+
+    local _pid=$$ _parent _command _i
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        _parent=$(ps -p "$_pid" -o ppid= 2>/dev/null | tr -d ' ')
+        [ -n "$_parent" ] && [ "$_parent" != "0" ] && [ "$_parent" != "1" ] || break
+        _command=$(ps -p "$_parent" -o command= 2>/dev/null)
+        case "$_command" in
+            *"/Orca.app/"*) return 0 ;;
+        esac
+        _pid=$_parent
+    done
+    return 1
+}
+
+# Older versions created one sticky note per Orca worker UUID, then briefly
+# used a workspace-level aggregate. The focus target is persisted alongside
+# every note, which lets us clean up only those stale notes without touching
+# regular Codex or Claude sessions.
+close_stale_orca_codex_notes() {
+    local _td="/tmp/cc-notify" _focus _state_key _session
+    [ -d "$_td" ] || return 0
+
+    for _focus in "$_td"/codex-*.focus.json; do
+        [ -f "$_focus" ] || continue
+        grep -q '"bundleId":"com.stablyai.orca"' "$_focus" 2>/dev/null || continue
+        _state_key=$(basename "${_focus%.focus.json}")
+        case "$_state_key" in
+            codex-[[:alnum:]]*) ;;
+            *) continue ;;
+        esac
+        # Keep the note for this pane and notes already migrated for other
+        # panes. The numeric key is the short-lived workspace aggregate used
+        # by the prior implementation and is safe to remove.
+        [ "$_state_key" = "$STATE_KEY" ] && continue
+        case "$_state_key" in codex-orca[0-9]*) ;; *) continue ;; esac
+        _session=${_state_key#codex-}
+        "$SKILL_SCRIPTS/notify.sh" --provider codex --state close --session "$_session" >/dev/null 2>&1
+    done
+}
+
 clean_prompt_label() {
     printf '%s' "$1" \
         | sed 's/\\n/ /g; s/\\r/ /g; s/\\t/ /g; s/[[:space:]]\{1,\}/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
@@ -285,7 +331,16 @@ if [ ! -t 0 ]; then
     PROJECT_CWD=$(json_get_string cwd 2>/dev/null || true)
 fi
 
-SESSION_KEY="${SESSION_KEY_OVERRIDE:-${SESSION_SHORT:-default}}"
+ORCA_CODEX_SESSION=0
+if [ "$PROVIDER" = "codex" ] && [ -z "$SESSION_KEY_OVERRIDE" ] && [ -n "${ORCA_PANE_KEY:-}" ]; then
+    ORCA_CODEX_SESSION=1
+    # A pane key is two UUIDs separated by a colon. Keep only alphanumerics
+    # for a portable temp-file name; the full 64 hex characters avoid clashes.
+    _orca_pane_key=$(printf '%s' "$ORCA_PANE_KEY" | tr -cd '[:alnum:]')
+    SESSION_KEY="orcapane${_orca_pane_key}"
+else
+    SESSION_KEY="${SESSION_KEY_OVERRIDE:-${SESSION_SHORT:-default}}"
+fi
 STATE_KEY="${PROVIDER}-${SESSION_KEY}"
 PROJECT=$(resolve_project_label)
 
@@ -327,6 +382,7 @@ if [ "$STATE" = "close" ]; then
     rm -f "$CONTENT_FILE" \
           "$TMP_DIR/${STATE_KEY}.sig" \
           "$TMP_DIR/${STATE_KEY}.focus" \
+          "$TMP_DIR/${STATE_KEY}.focus.json" \
           "$TMP_DIR/${STATE_KEY}.window" \
           "$TMP_DIR/${STATE_KEY}.pos" \
           "$TMP_DIR/${STATE_KEY}.wid" \
@@ -339,6 +395,13 @@ if [ "$STATE" = "close" ]; then
           2>/dev/null
     _log "CLOSE cleaned up temp files"
     exit 0
+fi
+
+# Collapse Orca's internal worker sessions into their originating pane note
+# and remove the one-time workspace aggregate left by the prior implementation.
+if [ "$ORCA_CODEX_SESSION" = "1" ]; then
+    close_stale_orca_codex_notes
+    _log "ORCA_GROUP pane=$ORCA_PANE_KEY session=$SESSION_KEY"
 fi
 
 # Codex has no SessionEnd hook; start a watcher to close the note when the
@@ -360,18 +423,54 @@ mkdir -p "$TMP_DIR"
 CONTENT_FILE="$TMP_DIR/${STATE_KEY}.txt"
 PID_FILE="$TMP_DIR/${STATE_KEY}.pid"
 FOCUS_FILE="$TMP_DIR/${STATE_KEY}.focus"
+FOCUS_TARGET_FILE="$TMP_DIR/${STATE_KEY}.focus.json"
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
+}
+
+write_focus_target() {
+    [ -f "$FOCUS_TARGET_FILE" ] && return 0
+    [ -n "$SOURCE_APP" ] || return 0
+
+    _focus_app=$(json_escape "$SOURCE_APP")
+    _focus_bundle=$(json_escape "$SOURCE_BUNDLE_ID")
+    _focus_source=$(json_escape "$FOCUS_RESOLUTION")
+    _focus_tmp="${FOCUS_TARGET_FILE}.$$"
+
+    if printf '{"appName":"%s","bundleId":"%s","resolution":"%s"}\n' \
+        "$_focus_app" "$_focus_bundle" "$_focus_source" > "$_focus_tmp" 2>/dev/null; then
+        mv -f "$_focus_tmp" "$FOCUS_TARGET_FILE" 2>/dev/null
+    fi
+
+    [ -f "$FOCUS_FILE" ] || printf '%s\n' "$SOURCE_APP" > "$FOCUS_FILE"
+}
+
+resolve_running_app_name() {
+    _bundle_id="$1"
+    osascript -e "tell application \"System Events\" to return name of first application process whose bundle identifier is \"$_bundle_id\"" 2>/dev/null
+}
 
 # Walk process tree (pure ps calls, fast, synchronous)
 _pid=$$
 _ancestors=""
+ORCA_SESSION=0
+CODEX_DESKTOP_SESSION=0
 for _i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     _pid=$(ps -p "$_pid" -o ppid= 2>/dev/null | tr -d ' ')
     if [ -z "$_pid" ] || [ "$_pid" = "0" ] || [ "$_pid" = "1" ]; then break; fi
     _ancestors="${_ancestors:+$_ancestors,}$_pid"
+    _ancestor_command=$(ps -p "$_pid" -o command= 2>/dev/null)
+    case "$_ancestor_command" in
+        *"/Orca.app/"*) ORCA_SESSION=1 ;;
+        *"/ChatGPT.app/"*|*"/Codex.app/"*) CODEX_DESKTOP_SESSION=1 ;;
+    esac
 done
 
 # Detect parent GUI app and front window via System Events (synchronous single call)
 SOURCE_APP=""
+SOURCE_BUNDLE_ID=""
+FOCUS_RESOLUTION=""
 if [ -n "$_ancestors" ]; then
     _wf="${FOCUS_FILE%.focus}.window"
     _posf="${FOCUS_FILE%.focus}.pos"
@@ -416,7 +515,7 @@ repeat with p in pids
                     set _py to (item 2 of _pos) as text
                 end if
             end try
-            return _n & \"|\" & _w & \"|\" & _px & \",\" & _py
+            return _n & \"|\" & (bundle identifier of proc as text) & \"|\" & _w & \"|\" & _px & \",\" & _py
         end if
     end try
 end repeat
@@ -424,9 +523,11 @@ end tell" 2>/dev/null)
     if [ -n "$_result" ]; then
         SOURCE_APP=$(printf '%s' "${_result%%|*}" | tr -d '\r\n')
         _rest="${_result#*|}"
+        SOURCE_BUNDLE_ID=$(printf '%s' "${_rest%%|*}" | tr -d '\r\n')
+        _rest="${_rest#*|}"
         _win=$(printf '%s' "${_rest%%|*}" | tr -d '\r\n')
         _pos=$(printf '%s' "${_rest#*|}" | tr -d '\r\n')
-        [ -n "$SOURCE_APP" ] && printf '%s\n' "$SOURCE_APP" > "$FOCUS_FILE"
+        [ -n "$SOURCE_APP" ] && FOCUS_RESOLUTION="ancestor"
         # Window title and position written only once (first notification wins):
         # Prevents later hooks (e.g. Stop) from overwriting the original target window
         # if the user has switched to a different window in the meantime.
@@ -454,6 +555,22 @@ if(!fallback){fallback=wid;}}}r||fallback;" 2>/dev/null)
         fi
     fi
 fi
+
+if [ -z "$SOURCE_APP" ] && [ "$CODEX_DESKTOP_SESSION" = "1" ]; then
+    SOURCE_BUNDLE_ID="com.openai.codex"
+    SOURCE_APP=$(resolve_running_app_name "$SOURCE_BUNDLE_ID")
+    SOURCE_APP=${SOURCE_APP:-ChatGPT}
+    FOCUS_RESOLUTION="codex-desktop-ancestor"
+    _log "FOCUS_FALLBACK source=$SOURCE_APP bundle=$SOURCE_BUNDLE_ID resolution=$FOCUS_RESOLUTION"
+elif [ -z "$SOURCE_APP" ] && [ "$ORCA_SESSION" = "1" ]; then
+    SOURCE_BUNDLE_ID="com.stablyai.orca"
+    SOURCE_APP=$(resolve_running_app_name "$SOURCE_BUNDLE_ID")
+    SOURCE_APP=${SOURCE_APP:-Orca}
+    FOCUS_RESOLUTION="orca-ancestor"
+    _log "FOCUS_FALLBACK source=$SOURCE_APP bundle=$SOURCE_BUNDLE_ID resolution=$FOCUS_RESOLUTION"
+fi
+
+write_focus_target
 
 # ── Ghostty: capture terminal ID + TTY for surface-level precise focus ─────
 # terminal ID uniquely identifies each split/tab surface; TTY is the fallback
